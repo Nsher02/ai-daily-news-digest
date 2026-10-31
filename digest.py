@@ -1,4 +1,4 @@
-"""Daily CS & AI news digest."""
+"""Daily AI news digest."""
 
 import argparse
 import calendar
@@ -9,6 +9,8 @@ import os
 import re
 import smtplib
 import ssl
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formataddr
@@ -20,20 +22,27 @@ import feedparser
 import requests
 import yaml
 from dotenv import load_dotenv
+import openai
 from openai import OpenAI
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
 LLM_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-DEFAULT_LLM_MODEL = "gemini-3.8-flash"
-SECTIONS = ["Top stories", "AI models & labs", "Industry & business", "Research", "Software & computing"]
+DEFAULT_LLM_MODEL = "gemini-3.5-flash"
+DEFAULT_LLM_LITE_MODEL = "gemini-3.5-flash-lite"
+NO_RETRY_STATUSES = {400, 401, 403, 404}  # retrying the same model won't help
+SECTIONS = ["Top stories", "AI models & labs", "Industry & funding", "Policy & society", "Research & tools"]
 
-PROMPT = """You are editing a daily CS & AI news digest for a CS grad student / software engineer.
+PROMPT = """You are editing a daily AI news digest for a CS grad student / software engineer.
 
-Below are today's items, each with a numeric ID. Pick the {max_stories} most important stories.
+Below are today's items, each with a numeric ID and its source. Pick the {min_stories}-{max_stories} most important stories.
+- Always return at least {min_stories} stories when the list has that many distinct stories.
 - Merge items that cover the same story into one story listing all their IDs.
+- A story covered by several sources is a strong signal of importance: rank it higher and list every one of its IDs.
+- Prioritize major model releases, big company and lab news, funding and acquisitions, and policy/regulation over minor product updates, tutorials and opinion pieces.
 - Skip promos, event ads, sponsored posts, listicles and fluff.
 - Group stories into these sections, in this order (omit empty ones): {sections}.
 - "Top stories" holds the 3-4 biggest stories of the day; don't repeat them in other sections.
+- Within each section, order stories from most to least important.
 - Write an original headline and a 1-2 sentence factual summary for each story.
 - Some items are marked "(title only)". For those, summarize ONLY what the headline itself says (e.g. "HN discussion of …" / "Post about …").
 - Never add details, causes, numbers or quotes that aren't in the item's title or snippet. If unsure, keep it short and say less.
@@ -64,6 +73,21 @@ def entry_time(entry):
     return None
 
 
+def fetch_issue_stories(url, settings):
+    """TLDR's feed has one empty item per newsletter issue; pull the issue's stories from its page."""
+    resp = requests.get(url, timeout=settings["request_timeout"], headers={"User-Agent": settings["user_agent"]})
+    resp.raise_for_status()
+    stories = []
+    for chunk in resp.text.split("<h3")[1:]:
+        heading, _, rest = chunk.partition("</h3>")
+        title = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", "<h3" + heading)).split())
+        if not title.endswith(")") or "(Sponsor)" in title:
+            continue  # section headers and ads
+        blurb = clean_text(rest.split("<h", 1)[0], 160)
+        stories.append(f"{title}: {blurb}")
+    return " | ".join(stories)
+
+
 def fetch_feed(feed, settings, cutoff):
     """Fetch one feed and return its recent items, newest first, capped at max_items."""
     resp = requests.get(
@@ -85,11 +109,29 @@ def fetch_feed(feed, settings, cutoff):
             continue
         if published < cutoff:
             continue
+        title = html.unescape(entry.get("title", "")).strip()
+        source = feed["name"]
+        summary = entry.get("summary", "")
+        if feed.get("strip_publisher"):
+            # Google News titles end with " - Publisher"; its summary just repeats the title.
+            headline, sep, publisher = title.rpartition(" - ")
+            if sep and headline:
+                title, source = headline.strip(), publisher.strip()
+            source = entry.get("source", {}).get("title") or source
+            if source.startswith("http"):
+                source = urlsplit(source).netloc.removeprefix("www.") or source
+            summary = ""
+        if feed.get("expand_issue") and not summary:
+            try:
+                summary = fetch_issue_stories(entry.get("link", ""), settings)
+            except Exception as e:
+                log.warning("%s: could not fetch issue page (%s)", feed["name"], e)
         items.append({
-            "source": feed["name"],
-            "title": html.unescape(entry.get("title", "")).strip(),
+            "source": source,
+            "title": title,
             "link": entry.get("link", ""),
-            "summary": entry.get("summary", ""),
+            "summary": summary,
+            "snippet_chars": feed.get("snippet_chars", 300),
             "published": published,
         })
     if undated:
@@ -158,24 +200,27 @@ def clean_text(text, limit):
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
-def summarize(items, settings):
-    """Ask the LLM to pick and summarize top stories; attach real links by ID."""
+def build_prompt(items, settings):
     lines = []
     for i, item in enumerate(items):
-        snippet = clean_text(item["summary"], 300)
+        snippet = clean_text(item["summary"], item["snippet_chars"])
         lines.append(f"[{i}] ({item['source']}) {item['title']}\n    {snippet or '(title only)'}")
-    prompt = PROMPT.format(
+    return PROMPT.format(
+        min_stories=settings["min_stories"],
         max_stories=settings["max_stories"],
         sections=", ".join(SECTIONS),
         items="\n".join(lines),
     )
-    client = OpenAI(api_key=os.environ["LLM_API_KEY"], base_url=LLM_BASE_URL, max_retries=5)
+
+
+def request_digest(client, model, prompt, items, timeout):
+    """One LLM request; returns the digest with real links attached by ID."""
     resp = client.chat.completions.create(
-        model=os.environ.get("LLM_MODEL") or DEFAULT_LLM_MODEL,
+        model=model,
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
         temperature=0.2,
-        timeout=settings["llm_timeout"],
+        timeout=timeout,
     )
     data = json.loads(resp.choices[0].message.content)
 
@@ -201,6 +246,83 @@ def summarize(items, settings):
     if not sections:
         raise ValueError("model returned no usable stories")
     return {"tldr": data.get("tldr", "").strip(), "note": "", "sections": sections}
+
+
+def describe_error(e):
+    """Status code and message of an LLM failure, for the Actions log."""
+    if isinstance(e, openai.APIStatusError):
+        detail = json.dumps(e.body)[:500] if e.body else e.message
+        return f"HTTP {e.status_code} {type(e).__name__}: {detail}"
+    return f"{type(e).__name__}: {e}"
+
+
+def run_llm_chain(items, settings, deadline):
+    """Primary model with retries, then the lite model once, then the primary after a long wait."""
+    prompt = build_prompt(items, settings)
+    timeout = settings["llm_timeout"]
+    client = OpenAI(api_key=os.environ["LLM_API_KEY"], base_url=LLM_BASE_URL, max_retries=0, timeout=timeout)
+    primary = os.environ.get("LLM_MODEL") or DEFAULT_LLM_MODEL
+    lite = os.environ.get("LLM_LITE_MODEL") or DEFAULT_LLM_LITE_MODEL
+
+    attempts = [(primary, 0)]
+    attempts += [(primary, settings["llm_backoff"] * 2**i) for i in range(settings["llm_retries"])]
+    attempts += [(lite, 0), (primary, settings["llm_final_wait"])]
+    min_stories = min(settings["min_stories"], len(items))
+    dead_models, short, last_error = set(), None, None
+
+    for n, (model, wait) in enumerate(attempts, 1):
+        final = n == len(attempts)
+        if model in dead_models or (final and short):
+            continue
+        if final:
+            # Shorten the long wait so the last attempt still gets a full timeout before the cap.
+            wait = min(wait, deadline - time.monotonic() - timeout)
+        if wait > 0:
+            log.info("LLM: waiting %ds before attempt %d", wait, n)
+            time.sleep(wait)
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            break
+        started = time.monotonic()
+        try:
+            digest = request_digest(client, model, prompt, items, min(timeout, remaining))
+        except Exception as e:
+            last_error = e
+            log.error("LLM attempt %d (%s) failed after %.0fs: %s", n, model, time.monotonic() - started, describe_error(e))
+            if isinstance(e, openai.APIStatusError) and e.status_code in NO_RETRY_STATUSES:
+                dead_models.add(model)
+            continue
+        count = sum(len(s["stories"]) for s in digest["sections"])
+        log.info("LLM attempt %d (%s) succeeded in %.0fs with %d stories", n, model, time.monotonic() - started, count)
+        if count >= min_stories:
+            return digest
+        log.warning("LLM returned only %d stories (want %d); trying again", count, min_stories)
+        short = digest
+    if short:
+        return short
+    raise last_error or TimeoutError("LLM step ran out of time")
+
+
+def summarize(items, settings):
+    """Run the LLM chain under a hard time cap, whatever the HTTP client does."""
+    cap = settings["llm_step_cap"]
+    result = {}
+
+    def run():
+        try:
+            # Stop a few seconds early so the chain normally ends on its own, before the watchdog.
+            result["digest"] = run_llm_chain(items, settings, time.monotonic() + cap - 5)
+        except Exception as e:
+            result["error"] = e
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(cap)
+    if worker.is_alive():
+        raise TimeoutError(f"LLM step hit the {cap}s hard cap")
+    if "error" in result:
+        raise result["error"]
+    return result["digest"]
 
 
 def fallback_digest(items):
@@ -310,7 +432,7 @@ def send_email(subject, text_body, html_body, email_config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Daily CS & AI news digest")
+    parser = argparse.ArgumentParser(description="Daily AI news digest")
     parser.add_argument("--dry-run", action="store_true", help="save digest.html instead of sending")
     args = parser.parse_args()
 
@@ -331,7 +453,7 @@ def main():
     try:
         digest = summarize(unique, settings)
     except Exception as e:
-        log.error("LLM summary failed, sending raw headlines instead (%s)", e)
+        log.error("LLM summary failed, sending raw headlines instead (%s)", describe_error(e))
         digest = fallback_digest(unique)
 
     now = datetime.now(ZoneInfo(settings["timezone"]))
