@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Dry-run output
+digest.html
+
+# Claude Code local settings
+.claude/

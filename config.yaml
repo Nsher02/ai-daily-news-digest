@@ -1,0 +1,44 @@
+settings:
+  lookback_hours: 26
+  timezone: America/Chicago
+  request_timeout: 20
+  max_stories: 15
+  llm_timeout: 180
+  user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+
+email:
+  subject_prefix: "AI Daily News Digest"
+  from_name: "AI News"
+  to_name: "Noah Sher"
+
+feeds:
+  - name: Hacker News (100+ points)
+    url: https://hnrss.org/frontpage?points=100
+    max_items: 20
+  - name: TechCrunch AI
+    url: https://techcrunch.com/category/artificial-intelligence/feed/
+    max_items: 15
+  - name: The Verge AI
+    url: https://www.theverge.com/rss/ai-artificial-intelligence/index.xml
+    max_items: 10
+  - name: Ars Technica AI
+    url: https://arstechnica.com/ai/feed/
+    max_items: 10
+  - name: MIT Technology Review AI
+    url: https://www.technologyreview.com/topic/artificial-intelligence/feed
+    max_items: 10
+  - name: OpenAI News
+    url: https://openai.com/news/rss.xml
+    max_items: 10
+  - name: Google DeepMind
+    url: https://deepmind.google/blog/rss.xml
+    max_items: 10
+  - name: Hugging Face Blog
+    url: https://huggingface.co/blog/feed.xml
+    max_items: 10
+  - name: arXiv cs.AI
+    url: https://rss.arxiv.org/rss/cs.AI
+    max_items: 25
+  - name: IEEE Spectrum Computing
+    url: https://spectrum.ieee.org/feeds/topic/computing.rss
+    max_items: 10
