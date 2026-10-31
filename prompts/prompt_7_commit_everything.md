@@ -1,0 +1,3 @@
+Update .gitignore so it only ignores .env and .venv. Remove the digest.html and .claude/ entries.
+Before committing, scan everything that will be committed (including .claude/, digest.html and prompts/) for my Gemini key, the "AIza" prefix, my app password, the app-password pattern, and password assignments. If anything is found, stop and tell me.
+Then commit everything with the message "Add remaining project files" and push to main. Confirm git status shows "working tree clean" and that main is up to date with origin/main.
