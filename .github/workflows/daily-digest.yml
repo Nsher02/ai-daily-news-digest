@@ -2,26 +2,59 @@ name: "AI Daily News Digest"
 
 on:
   schedule:
-    - cron: "0 8 * * *" # 8:00 AM Central, DST handled by GitHub
+    # Off the top of the hour, when GitHub drops or delays scheduled runs.
+    - cron: "53 7 * * *" # primary: 7:53 AM Central, DST handled by GitHub
+      timezone: "America/Chicago"
+    - cron: "23 8 * * *" # backup: 8:23 AM Central, skipped if the primary already succeeded
       timezone: "America/Chicago"
   workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+# If the primary run is delayed into the backup slot, the backup waits and then skips.
+concurrency:
+  group: daily-digest
+  cancel-in-progress: false
 
 jobs:
   digest:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
+      - name: Skip if today's digest already went out
+        id: guard
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          today=$(TZ=America/Chicago date +%F)
+          for ts in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow daily-digest.yml \
+                        --status success --limit 20 --json updatedAt --jq '.[].updatedAt'); do
+            if [ "$(TZ=America/Chicago date -d "$ts" +%F)" = "$today" ]; then
+              echo "A successful run already finished today ($ts); skipping."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "No successful run yet today ($today); continuing."
+
       - uses: actions/checkout@v7
+        if: steps.guard.outputs.skip != 'true'
 
       - uses: actions/setup-python@v7
+        if: steps.guard.outputs.skip != 'true'
         with:
           python-version: "3.13"
           cache: pip
 
       - name: Install dependencies
+        if: steps.guard.outputs.skip != 'true'
         run: pip install -r requirements.txt
 
       - name: Build and send digest
+        if: steps.guard.outputs.skip != 'true'
         run: python digest.py
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
