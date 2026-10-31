@@ -1,1 +1,1 @@
-# cs-ai-daily-news-digest
+# ai-daily-news-digest
