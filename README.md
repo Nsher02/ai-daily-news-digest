@@ -66,13 +66,12 @@ If the model returns fewer than `min_stories` stories, that counts as a failed a
 
 | Path | Purpose |
 | --- | --- |
-| `digest.py` | The whole pipeline: fetch, filter, dedupe, LLM summary, render, send. Also holds the LLM prompt, the section list, the model default and the API base URL. |
+| `digest.py` | The whole pipeline: fetch, filter, dedupe, LLM summary (with retry/fallback chain and hard cap), render, send. Also holds the LLM prompt, the section list, the primary and lite model defaults and the API base URL. |
 | `config.yaml` | Feeds and settings you'll edit most often (see [Configuration](#configuration-how-to-edit)). |
 | `requirements.txt` | Pinned dependencies: `feedparser`, `openai`, `python-dotenv`, `PyYAML`, `requests`. |
 | `.github/workflows/daily-digest.yml` | The GitHub Actions workflow: primary + backup schedule, skip-if-already-sent guard, Python setup, secrets → env vars, runs `python digest.py`. |
 | `prompts/` | The step-by-step build prompts used to create this project with Claude Code (`prompt_0_brief.md` … `prompt_10_fix_all.md`). History only; nothing reads them at runtime. |
-| `.claude/` | Claude Code project settings (`settings.json` holds tool-permission rules). Not used by the digest. |
-| `.gitignore` | Standard Python template plus `.env` and `.venv`. Keeps secrets and the virtualenv out of git; `__pycache__/` is ignored too. |
+| `.gitignore` | Standard Python template plus `.env`, `.venv` and `.claude/` (local Claude Code settings, not tracked). Keeps secrets and the virtualenv out of git; `__pycache__/` is ignored too. |
 | `digest.html` | Output of the last `--dry-run`. It's committed, so a dry run will show it as modified in `git status`. |
 | `README.md` | This file. |
 
@@ -344,10 +343,10 @@ Changing your Apple account password **revokes all app-specific passwords**. The
 
 ### If the repo is ever made public
 
-The repo is currently private. In a **public** repository, GitHub automatically disables scheduled workflows after **60 days with no repository activity**. If that happens, re-enable the workflow from the Actions tab or push any commit. Also review what's committed (`prompts/`, `.claude/`, `digest.html`) before making it public.
+The repo is currently private. In a **public** repository, GitHub automatically disables scheduled workflows after **60 days with no repository activity**. If that happens, re-enable the workflow from the Actions tab or push any commit. Also review what's committed (`prompts/`, `digest.html`) before making it public.
 
 ### Cost
 
 - **Gemini:** usually one or two requests per day (more on bad days, at most six), well within the Gemini API free tier. Free-tier limits and model availability change over time; check AI Studio if you start seeing 429s.
-- **GitHub Actions:** each run takes a minute or two. Public repos get free minutes on standard runners; private repos draw from the account's monthly included minutes (2,000 on the Free plan), so a daily run uses only a small fraction.
+- **GitHub Actions:** a normal run takes a minute or two, and the backup run usually skips in a few seconds. A run where Gemini is down can take about 12 minutes because of the 10-minute LLM cap. Public repos get free minutes on standard runners; private repos draw from the account's monthly included minutes (2,000 on the Free plan), so a daily run uses only a small fraction.
 - **iCloud Mail:** included with your Apple account.
