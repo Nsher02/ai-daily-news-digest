@@ -2,8 +2,13 @@ settings:
   lookback_hours: 26
   timezone: America/Chicago
   request_timeout: 20
+  min_stories: 10
   max_stories: 15
-  llm_timeout: 180
+  llm_timeout: 60       # seconds per LLM request
+  llm_retries: 3        # retries of the primary model
+  llm_backoff: 2        # seconds; doubles each retry (2, 4, 8)
+  llm_final_wait: 300   # seconds before the last try of the primary model
+  llm_step_cap: 600     # hard cap on the whole LLM step, in seconds
   user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 
 email:
@@ -12,9 +17,6 @@ email:
   to_name: "Noah Sher"
 
 feeds:
-  - name: Hacker News (100+ points)
-    url: https://hnrss.org/frontpage?points=100
-    max_items: 20
   - name: TechCrunch AI
     url: https://techcrunch.com/category/artificial-intelligence/feed/
     max_items: 15
@@ -27,6 +29,12 @@ feeds:
   - name: MIT Technology Review AI
     url: https://www.technologyreview.com/topic/artificial-intelligence/feed
     max_items: 10
+  - name: Wired AI
+    url: https://www.wired.com/feed/tag/ai/latest/rss
+    max_items: 10
+  - name: The Decoder
+    url: https://the-decoder.com/feed/
+    max_items: 15
   - name: OpenAI News
     url: https://openai.com/news/rss.xml
     max_items: 10
@@ -36,9 +44,19 @@ feeds:
   - name: Hugging Face Blog
     url: https://huggingface.co/blog/feed.xml
     max_items: 10
-  - name: arXiv cs.AI
-    url: https://rss.arxiv.org/rss/cs.AI
-    max_items: 25
-  - name: IEEE Spectrum Computing
-    url: https://spectrum.ieee.org/feeds/topic/computing.rss
-    max_items: 10
+  - name: TLDR AI
+    url: https://tldr.tech/api/rss/ai
+    max_items: 5
+    expand_issue: true    # feed items are empty; read stories from the issue page
+    snippet_chars: 1500
+  - name: Google News – AI
+    url: https://news.google.com/rss/search?q=%22artificial+intelligence%22+OR+%22generative+AI%22+OR+LLM&hl=en-US&gl=US&ceid=US:en
+    max_items: 20
+    strip_publisher: true
+  - name: Google News – Labs
+    url: https://news.google.com/rss/search?q=Anthropic+OR+%22Meta+AI%22+OR+xAI+OR+Mistral&hl=en-US&gl=US&ceid=US:en
+    max_items: 15
+    strip_publisher: true
+  - name: Hacker News (100+ points)
+    url: https://hnrss.org/frontpage?points=100
+    max_items: 15

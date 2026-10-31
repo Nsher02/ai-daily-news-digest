@@ -1,6 +1,6 @@
 # ai-daily-news-digest
 
-A personal daily email digest of AI and CS news, delivered to an iCloud inbox every morning. A single Python script pulls about ten RSS feeds, asks Google Gemini to pick and summarize the most important stories, and sends a mobile-friendly HTML email through iCloud SMTP. GitHub Actions runs it on a schedule, so nothing needs to stay running on your machine.
+A personal daily email digest of AI news, delivered to an iCloud inbox every morning. A single Python script pulls 13 RSS feeds, asks Google Gemini to pick and summarize the most important stories, and sends a mobile-friendly HTML email through iCloud SMTP. GitHub Actions runs it on a schedule, so nothing needs to stay running on your machine.
 
 ---
 
@@ -10,10 +10,10 @@ Everything lives in `digest.py`; `main()` runs these steps in order.
 
 | # | Step | Function | What happens |
 | --- | --- | --- | --- |
-| 1 | Fetch | `fetch_all` / `fetch_feed` | Downloads each feed in `config.yaml` with `requests` (timeout `request_timeout`, browser-like `user_agent`) and parses it with `feedparser`. |
+| 1 | Fetch | `fetch_all` / `fetch_feed` | Downloads each feed in `config.yaml` with `requests` (timeout `request_timeout`, browser-like `user_agent`) and parses it with `feedparser`. Google News titles lose their ` - Publisher` suffix and the publisher becomes the source; TLDR AI's empty issue items are filled in from the issue page (`fetch_issue_stories`). |
 | 2 | Filter | `fetch_feed` | Keeps items published in the last `lookback_hours`. Items with no date are dropped (logged as a warning). Each feed is sorted newest first and capped at its `max_items`. |
 | 3 | Dedupe | `dedupe` | Drops an item if its **normalized URL** or **normalized title** was already seen. The first occurrence wins, in feed order. |
-| 4 | Summarize | `summarize` | Sends all items to Gemini in one request. The model picks up to `max_stories` stories, merges duplicates, sorts them into sections, and returns JSON. |
+| 4 | Summarize | `summarize` / `run_llm_chain` | Sends all items to Gemini in one request. The model picks `min_stories`–`max_stories` stories (10–15), merges duplicates, ranks multi-source stories higher, sorts them into sections, and returns JSON. Wrapped in a retry/fallback chain with a hard time cap (see [Failure behavior](#failure-behavior)). |
 | 5 | Render | `render_html` / `render_text` | Builds an inline-CSS HTML email (600px card, table layout) plus a plain-text alternative. |
 | 6 | Send | `send_email` | Connects to `SMTP_HOST:SMTP_PORT`, upgrades with STARTTLS, logs in as `SMTP_USER`, sends from `EMAIL_FROM`. |
 
@@ -21,7 +21,7 @@ Everything lives in `digest.py`; `main()` runs these steps in order.
 - URL: lowercase scheme and host, strip `www.`, drop `utm_*` query params, the `#fragment` and a trailing `/`. Other query params are kept (so `?id=1` and `?id=2` stay distinct).
 - Title: lowercase, curly quotes → straight, punctuation removed, whitespace collapsed.
 
-This only catches *exact* duplicates. The same story covered by two outlets with different headlines gets through dedupe, and the LLM merges it in step 4.
+This only catches *exact* duplicates. The same story covered by two outlets with different headlines gets through dedupe, and the LLM merges it in step 4. The prompt treats a story covered by several sources as a strong signal of importance: it ranks higher and lists every source. It also prioritizes major model releases, big company and lab news, funding and policy over minor product updates.
 
 ### The ID-mapping design (why links can't be invented)
 
@@ -35,7 +35,7 @@ The code then maps each ID back to the real feed item and attaches *that item's*
 
 ### The "(title only)" anti-hallucination rule
 
-Some feeds carry no real description. Hacker News (hnrss) fills the summary with boilerplate like `Article URL: … Comments URL: … Points: 132 # Comments: 72`. `clean_text` strips HTML tags and that boilerplate (`FEED_BOILERPLATE`) and truncates to 300 characters. If nothing is left, the item is sent to the model marked **`(title only)`**.
+Some feeds carry no real description. Hacker News (hnrss) fills the summary with boilerplate like `Article URL: … Comments URL: … Points: 132 # Comments: 72`. `clean_text` strips HTML tags and that boilerplate (`FEED_BOILERPLATE`) and truncates to 300 characters (or the feed's `snippet_chars`; TLDR AI uses 1500 because one item holds a whole newsletter issue). Google News summaries only repeat the title, so they're dropped. If nothing is left, the item is sent to the model marked **`(title only)`**.
 
 The prompt tells the model to summarize those items using only what the headline says ("HN discussion of …"), and never to add details, causes, numbers or quotes that aren't in the title or snippet. Temperature is `0.2` to keep output conservative.
 
@@ -45,8 +45,20 @@ The prompt tells the model to summarize those items using only what the headline
 | --- | --- | --- |
 | One feed fails (timeout, HTTP error, unparseable) | Logged as `ERROR <feed>: failed, skipping`; the run continues with the other feeds. **No retry.** | 0 |
 | No items at all after fetch + dedupe | Logs `no items at all; nothing to send` and **sends nothing**. | 0 |
-| Gemini error (503, rate limit, timeout, bad JSON, zero usable stories) | The OpenAI client first retries up to **5 times** with exponential backoff. If it still fails, the email is sent anyway as a **raw-headlines fallback**: every item grouped by source, under a yellow note saying "The AI summary failed today…". | 0 |
-| Sending the email fails (bad login, SMTP down) | Logs `sending email failed: …` and exits non-zero so the GitHub run shows **red**. | 1 |
+| Gemini error (503, 429, timeout, bad JSON, zero usable stories) | Runs the LLM fallback chain below. If every step fails, the email is sent anyway as a **raw-headlines fallback**: every item grouped by source, under a yellow note saying "The AI summary failed today…". | 0 |
+| Sending the email fails (bad login, SMTP down) | Logs `sending email failed: …` and exits non-zero so the GitHub run shows **red**. The SMTP connection has a 30s timeout. | 1 |
+
+**LLM fallback chain** (`run_llm_chain`, all values in `config.yaml`):
+
+1. Primary model (`gemini-3.5-flash`), **60s timeout per request** (`llm_timeout`).
+2. Up to **3 retries** of the primary with exponential backoff of 2s, 4s, 8s (`llm_retries`, `llm_backoff`). Errors 400/401/403/404 skip the remaining retries, since retrying the same model won't help.
+3. The lighter model (`gemini-3.5-flash-lite`) **once**.
+4. Wait **5 minutes** (`llm_final_wait`), then the primary one last time.
+5. Only then: the raw-headlines fallback email.
+
+If the model returns fewer than `min_stories` stories, that counts as a failed attempt, but the short digest is kept and used if nothing better comes back. Every failed attempt logs the exact cause, for example `ERROR LLM attempt 1 (gemini-3.5-flash) failed after 4s: HTTP 503 InternalServerError: [{"error": {"code": 503, "message": "This model is currently experiencing high demand. …"}}]`.
+
+**Hard cap:** the whole LLM step finishes within **10 minutes** (`llm_step_cap: 600`) no matter what. The chain shortens the 5-minute wait if needed so the last attempt fits, and a watchdog thread gives up on the step at the cap even if a request hangs and ignores its timeout. Worst case: about 4.5 min of primary attempts, 1 min of Flash-Lite, a wait shortened to about 3.5 min, then 1 min for the final try.
 
 ---
 
@@ -57,8 +69,8 @@ The prompt tells the model to summarize those items using only what the headline
 | `digest.py` | The whole pipeline: fetch, filter, dedupe, LLM summary, render, send. Also holds the LLM prompt, the section list, the model default and the API base URL. |
 | `config.yaml` | Feeds and settings you'll edit most often (see [Configuration](#configuration-how-to-edit)). |
 | `requirements.txt` | Pinned dependencies: `feedparser`, `openai`, `python-dotenv`, `PyYAML`, `requests`. |
-| `.github/workflows/daily-digest.yml` | The GitHub Actions workflow: schedule, Python setup, secrets → env vars, runs `python digest.py`. |
-| `prompts/` | The step-by-step build prompts used to create this project with Claude Code (`prompt_0_brief.md` … `prompt_8_readme.md`). History only; nothing reads them at runtime. |
+| `.github/workflows/daily-digest.yml` | The GitHub Actions workflow: primary + backup schedule, skip-if-already-sent guard, Python setup, secrets → env vars, runs `python digest.py`. |
+| `prompts/` | The step-by-step build prompts used to create this project with Claude Code (`prompt_0_brief.md` … `prompt_10_fix_all.md`). History only; nothing reads them at runtime. |
 | `.claude/` | Claude Code project settings (`settings.json` holds tool-permission rules). Not used by the digest. |
 | `.gitignore` | Standard Python template plus `.env` and `.venv`. Keeps secrets and the virtualenv out of git; `__pycache__/` is ignored too. |
 | `digest.html` | Output of the last `--dry-run`. It's committed, so a dry run will show it as modified in `git status`. |
@@ -68,23 +80,31 @@ The prompt tells the model to summarize those items using only what the headline
 
 ## Schedule
 
-The workflow runs **daily at 8:00 AM America/Chicago**:
+The workflow has a **primary** and a **backup** scheduled run, both in America/Chicago time:
 
 ```yaml
 on:
   schedule:
-    - cron: "0 8 * * *"
+    - cron: "53 7 * * *" # primary: 7:53 AM Central
+      timezone: "America/Chicago"
+    - cron: "23 8 * * *" # backup: 8:23 AM Central
       timezone: "America/Chicago"
   workflow_dispatch:
 ```
 
-The `timezone` field takes an IANA name and GitHub handles daylight saving, so it stays at 8:00 local time all year. Without `timezone`, cron times are UTC.
+Both times are deliberately **off the top of the hour**. GitHub is busiest at :00 and drops or delays scheduled runs then (the old `0 8 * * *` schedule once never fired at all).
+
+**Skip guard:** the first step of a *scheduled* run uses the preinstalled `gh` CLI (`GH_TOKEN: ${{ github.token }}`, with `permissions: actions: read` and `contents: read`) to check whether a successful run of this workflow already finished **today**, by America/Chicago date. If one did, every later step is skipped, so the backup only sends when the primary failed or never fired. Manual `workflow_dispatch` runs never run the guard and always send. A `concurrency` group makes a backup that starts while a delayed primary is still running wait for it, then skip.
+
+The `timezone` field takes an IANA name and GitHub handles daylight saving, so the times stay local all year. Without `timezone`, cron times are UTC.
 
 **To change the time or time zone**, edit both places so the email date matches the send time:
 
-1. `.github/workflows/daily-digest.yml`: the `cron` (minute hour) and `timezone`. Example for 6:30 AM Pacific:
+1. `.github/workflows/daily-digest.yml`: both `cron` entries (minute hour), their `timezone`, and the `TZ=America/Chicago` used by the skip guard. Example for 6:37 AM Pacific with a 7:07 backup:
    ```yaml
-       - cron: "30 6 * * *"
+       - cron: "37 6 * * *"
+         timezone: "America/Los_Angeles"
+       - cron: "7 7 * * *"
          timezone: "America/Los_Angeles"
    ```
 2. `config.yaml`: `settings.timezone` (used for the date in the subject and heading):
@@ -92,11 +112,11 @@ The `timezone` field takes an IANA name and GitHub handles daylight saving, so i
      timezone: America/Los_Angeles
    ```
 
-**Runs can start late.** GitHub queues scheduled runs and they often start several minutes (sometimes much more) after the cron time, especially at the top of the hour when load is highest; under heavy load a run can occasionally be skipped. If that matters, pick an off-peak minute like `"7 8 * * *"`. Scheduled runs only fire from the default branch (`main`).
+**Runs can start late.** GitHub queues scheduled runs and they often start several minutes (sometimes much more) after the cron time; under heavy load a run can be skipped entirely, which is what the backup run is for. Keep both times off the top of the hour. Scheduled runs only fire from the default branch (`main`).
 
 **Manual run:** GitHub → **Actions** → **AI Daily News Digest** → **Run workflow** → branch `main` → **Run workflow**. This sends a real email.
 
-The job runs on `ubuntu-latest` with Python 3.13, caches pip, and has a 10-minute timeout.
+The job runs on `ubuntu-latest` with Python 3.13, caches pip, and has a **20-minute** timeout (`timeout-minutes: 20`), comfortably above the 10-minute LLM cap.
 
 ---
 
@@ -109,15 +129,40 @@ The job runs on `ubuntu-latest` with Python 3.13, caches pip, and has a 10-minut
 | `settings.lookback_hours` | `26` | How far back to keep items. 26 rather than 24 gives slack for late runs and odd feed timestamps. |
 | `settings.timezone` | `America/Chicago` | Time zone for the date in the subject and email heading. Does **not** control when the workflow runs. |
 | `settings.request_timeout` | `20` | Seconds per feed request. |
+| `settings.min_stories` | `10` | Minimum stories in the email whenever enough items exist. |
 | `settings.max_stories` | `15` | Max stories the LLM is asked to pick. |
-| `settings.llm_timeout` | `180` | Seconds per Gemini request (per attempt). |
+| `settings.llm_timeout` | `60` | Seconds per Gemini request (per attempt). |
+| `settings.llm_retries` | `3` | Retries of the primary model. |
+| `settings.llm_backoff` | `2` | Seconds before the first retry; doubles each time (2, 4, 8). |
+| `settings.llm_final_wait` | `300` | Seconds to wait before the last try of the primary model (shortened if needed to fit the cap). |
+| `settings.llm_step_cap` | `600` | Hard cap on the whole LLM step, in seconds. |
 | `settings.user_agent` | browser UA string | Sent with feed requests; some sites block default Python agents. |
 | `email.subject_prefix` | `AI Daily News Digest` | Subject is `<prefix> — <Weekday, Month Day>`. Also the big heading at the top of the email. |
 | `email.from_name` | `AI News` | Display name on the From line. |
 | `email.to_name` | `Noah Sher` | Display name on the To line. |
-| `feeds[]` | 10 feeds | Each has `name` (shown in the email), `url` and `max_items` (cap per run). |
+| `feeds[]` | 13 feeds | Each has `name` (shown in the email), `url` and `max_items` (cap per run). Optional: `snippet_chars` (snippet length sent to the LLM, default 300), `strip_publisher: true` (Google News: strip ` - Publisher` from titles and show the publisher as the source), `expand_issue: true` (TLDR: read the issue's stories from its web page). |
 
 Headers are built with `email.utils.formataddr`, so names containing `&` or non-ASCII characters are encoded correctly.
+
+### News sources
+
+| Source | `max_items` | Notes |
+| --- | --- | --- |
+| TechCrunch AI | 15 | |
+| The Verge AI | 10 | |
+| Ars Technica AI | 10 | |
+| MIT Technology Review AI | 10 | Publishes a few times a week; often 0 items in a given 26h window. |
+| Wired AI | 10 | |
+| The Decoder | 15 | |
+| OpenAI News | 10 | Only has items on days OpenAI posts. |
+| Google DeepMind | 10 | Only has items on days DeepMind posts. |
+| Hugging Face Blog | 10 | |
+| TLDR AI | 5 | One empty item per newsletter issue (weekdays only); stories are pulled from the issue page and sent with a 1500-char snippet. |
+| Google News – AI | 20 | Search: "artificial intelligence" OR "generative AI" OR LLM. Publisher shown as the source. |
+| Google News – Labs | 15 | Search: Anthropic OR "Meta AI" OR xAI OR Mistral. Publisher shown as the source. |
+| Hacker News (100+ points) | 15 | Front-page stories with 100+ points. |
+
+A source with 0 items on a given day is normal (quiet blogs, weekends). A source that **fails** logs `ERROR <name>: failed, skipping`.
 
 ### Add or remove a news source
 
@@ -144,7 +189,7 @@ settings:
 Sections are **not** in `config.yaml`. They're the `SECTIONS` list near the top of `digest.py`:
 
 ```python
-SECTIONS = ["Top stories", "AI models & labs", "Industry & business", "Research", "Software & computing"]
+SECTIONS = ["Top stories", "AI models & labs", "Industry & funding", "Policy & society", "Research & tools"]
 ```
 
 Edit the list. The prompt passes it to the model in order and tells it to omit empty sections. The rule that "Top stories" holds the 3–4 biggest stories is in `PROMPT` just below; update it if you rename or remove that section.
@@ -162,10 +207,10 @@ email:
 
 The script uses the `openai` Python package against any **OpenAI-compatible** chat-completions endpoint, with JSON mode (`response_format={"type": "json_object"}`).
 
-**Model:** set the `LLM_MODEL` env var; if it's unset or empty the code falls back to `DEFAULT_LLM_MODEL` in `digest.py` (currently `gemini-3.8-flash`).
+**Models:** the primary model comes from the `LLM_MODEL` env var, falling back to `DEFAULT_LLM_MODEL` in `digest.py` (currently `gemini-3.5-flash`). The lighter fallback model comes from `LLM_LITE_MODEL`, falling back to `DEFAULT_LLM_LITE_MODEL` (currently `gemini-3.5-flash-lite`). `gemini-3.8-flash` was the default until October 2026, but it frequently returned 503/429 or hung, which caused the fallback emails and a cancelled run.
 
-- Locally: add `LLM_MODEL=gemini-3.8-flash-lite` to `.env`.
-- On GitHub: the workflow does **not** pass `LLM_MODEL` today, so the default is always used. Either change `DEFAULT_LLM_MODEL` in `digest.py`, or add a repository *variable* (Settings → Secrets and variables → Actions → Variables) and pass it in the workflow's `env:` block:
+- Locally: add `LLM_MODEL=…` / `LLM_LITE_MODEL=…` to `.env`.
+- On GitHub: the workflow does **not** pass these today, so the defaults are always used. Either change `DEFAULT_LLM_MODEL` in `digest.py`, or add a repository *variable* (Settings → Secrets and variables → Actions → Variables) and pass it in the workflow's `env:` block:
   ```yaml
             LLM_MODEL: ${{ vars.LLM_MODEL }}
   ```
@@ -180,6 +225,8 @@ c = OpenAI(api_key=os.environ['LLM_API_KEY'], base_url='https://generativelangua
 print('\n'.join(sorted(m.id for m in c.models.list())))
 "
 ```
+
+A name in this list isn't a guarantee: `gemini-2.5-flash` is listed but returns 404 for chat. Test a model with a real dry run before switching.
 
 **Provider:** the base URL is a constant in `digest.py`, **not** an env var:
 
@@ -235,7 +282,8 @@ SMTP_PASSWORD=<app-specific-password>
 EMAIL_TO=<you>@icloud.com
 EMAIL_FROM=<your-alias>@icloud.com
 # optional:
-# LLM_MODEL=gemini-3.8-flash
+# LLM_MODEL=gemini-3.5-flash
+# LLM_LITE_MODEL=gemini-3.5-flash-lite
 ```
 
 **Dry run** (fetches and summarizes for real, but saves `digest.html` and prints the plain-text version instead of emailing):
@@ -268,10 +316,13 @@ Open **Actions** → the failed run → the **digest** job → expand **Build an
 | `KeyError: 'SMTP_USER'` (or another name) | A secret is missing or misnamed. Names are case-sensitive and must match the table above exactly. | Add or rename the secret. |
 | `sending email failed: (535, …)` or another auth error | App-specific password revoked or wrong; `SMTP_USER` wrong. | Generate a new app-specific password and update `SMTP_PASSWORD`. |
 | `sending email failed` mentioning the sender address | `EMAIL_FROM` isn't an active alias on the `SMTP_USER` account. | Fix the alias, or delete the `EMAIL_FROM` secret to send from `SMTP_USER`. |
-| `Retrying request …` then `LLM summary failed … (Error code: 503)` or `429` | Gemini overloaded or rate-limited. The email still went out as raw headlines, and the run is **green**. | Usually transient; no action. If it persists, check your quota in AI Studio or switch to a lighter model. |
-| `LLM summary failed … 400`/`401`/`403` | Bad or revoked `LLM_API_KEY`, or the model name no longer exists. | Rotate the key, or update `DEFAULT_LLM_MODEL`. |
+| `LLM attempt N (…) failed …: HTTP 503` or `HTTP 429` | Gemini overloaded or rate-limited. A later attempt usually succeeds. If all fail, the email goes out as raw headlines and the run stays **green**. | Usually transient. If it happens daily, check your quota in AI Studio or switch `DEFAULT_LLM_MODEL`. |
+| `LLM attempt N (…) failed …: APITimeoutError` | A request hung past the 60s timeout. | Transient; the chain moves on. |
+| `LLM attempt N (…) failed …: HTTP 400`/`401`/`403`/`404` | Bad or revoked `LLM_API_KEY`, or the model name no longer exists. | Rotate the key, or update `DEFAULT_LLM_MODEL` / `DEFAULT_LLM_LITE_MODEL`. |
+| `LLM summary failed … LLM step hit the 600s hard cap` | Every attempt hung; the watchdog stopped the step and sent raw headlines. | Transient Gemini outage; no action unless it repeats. |
+| `A successful run already finished today …; skipping.` | Normal for the backup run when the primary already sent. | None. |
 | `ERROR <feed>: failed, skipping (…)` | One feed is down, moved, or blocking the request. The run continues and stays green. | If it repeats for days, fix or remove the URL in `config.yaml`. |
-| `Error: The operation was canceled` after 10 minutes | Hit `timeout-minutes: 10` (very slow Gemini plus retries). | Rare; rerun. Raise `timeout-minutes` if it recurs. |
+| `Error: The operation was canceled` after 20 minutes | Hit `timeout-minutes: 20`. Shouldn't happen, since the LLM step is capped at 10 minutes. | Rerun, and check which step was slow. |
 
 ### Changing your Apple account password
 
@@ -297,6 +348,6 @@ The repo is currently private. In a **public** repository, GitHub automatically 
 
 ### Cost
 
-- **Gemini:** one request per day, well within the Gemini API free tier. Free-tier limits and model availability change over time; check AI Studio if you start seeing 429s.
+- **Gemini:** usually one or two requests per day (more on bad days, at most six), well within the Gemini API free tier. Free-tier limits and model availability change over time; check AI Studio if you start seeing 429s.
 - **GitHub Actions:** each run takes a minute or two. Public repos get free minutes on standard runners; private repos draw from the account's monthly included minutes (2,000 on the Free plan), so a daily run uses only a small fraction.
 - **iCloud Mail:** included with your Apple account.
