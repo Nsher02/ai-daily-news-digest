@@ -6,7 +6,7 @@ on:
     # (UTC-6) and CDT (UTC-5); the "Check send window" step drops the extra firings.
     - cron: "53 12,13,14 * * *"
     - cron: "23 12,13,14 * * *"
-    - cron: "42 18 * * *" # TEMPORARY: proves the scheduler fires; remove after one run
+    - cron: "2 20 * * *" # TEMPORARY: proves the scheduler fires; remove after one run
   workflow_dispatch:
 
 permissions:
@@ -20,13 +20,13 @@ concurrency:
 
 jobs:
   scheduler-test:
-    if: github.event.schedule == '42 18 * * *'
+    if: github.event.schedule == '2 20 * * *'
     runs-on: ubuntu-latest
     steps:
       - run: 'echo "TEST: scheduler fired"'
 
   digest:
-    if: github.event.schedule != '42 18 * * *'
+    if: github.event.schedule != '2 20 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
