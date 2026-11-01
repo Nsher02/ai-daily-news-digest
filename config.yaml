@@ -49,8 +49,8 @@ feeds:
   - name: TLDR AI
     url: https://tldr.tech/api/rss/ai
     max_items: 5
-    expand_issue: true    # feed items are empty; read stories from the issue page
-    snippet_chars: 1500
+    expand_issue: true    # expand into individual articles; max_items caps stories
+    snippet_chars: 1500   # per-story snippet cap
   - name: Google News – AI
     url: https://news.google.com/rss/search?q=%22artificial+intelligence%22+OR+%22generative+AI%22+OR+LLM&hl=en-US&gl=US&ceid=US:en
     max_items: 20

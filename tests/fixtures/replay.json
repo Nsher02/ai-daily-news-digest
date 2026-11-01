@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "date": "2026-10-31T08:00:00-05:00",
+  "settings": {
+    "min_stories": 10,
+    "max_stories": 15
+  },
+  "heading": "AI Daily News Digest",
+  "items": [
+    {
+      "source": "Example Lab",
+      "title": "Example Lab releases a model",
+      "link": "https://example.com/model",
+      "summary": "The model has 8 billion parameters and downloadable weights.",
+      "snippet_chars": 300,
+      "image": ""
+    }
+  ],
+  "digest": {
+    "tldr": "Initial brief",
+    "note": "",
+    "sections": [
+      {
+        "name": "Top stories",
+        "stories": [
+          {
+            "ids": [
+              0
+            ],
+            "headline": "Initial headline",
+            "summary": "Initial summary",
+            "links": [
+              {
+                "source": "Example Lab",
+                "url": "https://example.com/model"
+              }
+            ],
+            "url": "https://example.com/model",
+            "image": "",
+            "article": null
+          }
+        ]
+      }
+    ],
+    "replay_responses": {
+      "pass1": "{\"tldr\": \"Initial brief\", \"sections\": [{\"name\": \"Top stories\", \"stories\": [{\"ids\": [0], \"headline\": \"Initial headline\", \"summary\": \"Initial summary\"}]}], \"excluded_ids\": []}",
+      "pass2": "{\"tldr\": \"Example Lab released an 8-billion-parameter model with downloadable weights.\", \"stories\": [{\"n\": 1, \"headline\": \"Example Lab releases 8B model\", \"summary\": \"Example Lab released a model with 8 billion parameters. Its weights are available to download.\"}]}"
+    }
+  }
+}
