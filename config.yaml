@@ -2,6 +2,8 @@ settings:
   lookback_hours: 26
   timezone: America/Chicago
   request_timeout: 20
+  article_timeout: 10   # seconds per article page / image check (pass 2)
+  article_chars: 4000   # article text sent to the LLM per story
   min_stories: 10
   max_stories: 15
   llm_timeout: 60       # seconds per LLM request
