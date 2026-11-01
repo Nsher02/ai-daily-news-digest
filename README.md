@@ -1,6 +1,6 @@
 # ai-daily-news-digest
 
-A personal daily email digest of AI news, delivered to an iCloud inbox every morning. A single Python script pulls 13 RSS feeds, asks Google Gemini to pick and summarize the most important stories, and sends a mobile-friendly HTML email through iCloud SMTP. GitHub Actions runs it on a schedule, so nothing needs to stay running on your machine.
+A personal daily email digest of AI news, delivered to an iCloud inbox every morning. A single Python script pulls 13 RSS feeds, asks Google Gemini to pick the most important stories, reads each story's full article, has Gemini write a paragraph-length summary of each, and sends a news-app-style HTML email (with article images, light and dark mode) through iCloud SMTP. GitHub Actions runs it on a schedule, so nothing needs to stay running on your machine.
 
 ---
 
@@ -13,15 +13,17 @@ Everything lives in `digest.py`; `main()` runs these steps in order.
 | 1 | Fetch | `fetch_all` / `fetch_feed` | Downloads each feed in `config.yaml` with `requests` (timeout `request_timeout`, browser-like `user_agent`) and parses it with `feedparser`. Google News titles lose their ` - Publisher` suffix and the publisher becomes the source; TLDR AI's empty issue items are filled in from the issue page (`fetch_issue_stories`). |
 | 2 | Filter | `fetch_feed` | Keeps items published in the last `lookback_hours`. Items with no date are dropped (logged as a warning). Each feed is sorted newest first and capped at its `max_items`. |
 | 3 | Dedupe | `dedupe` | Drops an item if its **normalized URL** or **normalized title** was already seen. The first occurrence wins, in feed order. |
-| 4 | Summarize | `summarize` / `run_llm_chain` | Sends all items to Gemini in one request. The model picks `min_stories`–`max_stories` stories (10–15), merges duplicates, ranks multi-source stories higher, sorts them into sections, and returns JSON. Wrapped in a retry/fallback chain with a hard time cap (see [Failure behavior](#failure-behavior)). |
-| 5 | Render | `render_html` / `render_text` | Builds an inline-CSS HTML email (600px card, table layout) plus a plain-text alternative. |
-| 6 | Send | `send_email` | Connects to `SMTP_HOST:SMTP_PORT`, upgrades with STARTTLS, logs in as `SMTP_USER`, sends from `EMAIL_FROM`. |
+| 4 | Pass 1: pick | `summarize` / `run_llm_chain` | Sends all items to Gemini in one request. The model picks `min_stories`–`max_stories` stories (10–15), merges duplicates, ranks multi-source stories higher, sorts them into sections, and returns JSON with short summaries. |
+| 5 | Read articles | `enrich_story` | For each picked story, in parallel (10 workers): resolves Google News redirect links to the publisher's URL (`decode_google_news`), fetches the article page (`article_timeout`, 10s) and extracts the main text with **trafilatura**, trimmed to `article_chars` (4,000). Also picks the story's image (see [Email design](#email-design)). |
+| 6 | Pass 2: write | `build_summary_prompt` / `run_llm_chain` | **One** batched Gemini request writes a 4–6 sentence paragraph per story (what happened, key details and numbers, why it matters) using only the fetched article text and feed snippets. Stories whose article couldn't be fetched get 1–3 sentences from the snippets only. |
+| 7 | Render | `render_html` / `render_text` | Builds the email-safe HTML (table layout, inline CSS, dark-mode styles) plus a plain-text alternative. |
+| 8 | Send | `send_email` | Connects to `SMTP_HOST:SMTP_PORT`, upgrades with STARTTLS, logs in as `SMTP_USER`, sends from `EMAIL_FROM`. |
 
 **Normalization used by dedupe:**
 - URL: lowercase scheme and host, strip `www.`, drop `utm_*` query params, the `#fragment` and a trailing `/`. Other query params are kept (so `?id=1` and `?id=2` stay distinct).
 - Title: lowercase, curly quotes → straight, punctuation removed, whitespace collapsed.
 
-This only catches *exact* duplicates. The same story covered by two outlets with different headlines gets through dedupe, and the LLM merges it in step 4. The prompt treats a story covered by several sources as a strong signal of importance: it ranks higher and lists every source. It also prioritizes major model releases, big company and lab news, funding and policy over minor product updates.
+This only catches *exact* duplicates. The same story covered by two outlets with different headlines gets through dedupe, and the LLM merges it in pass 1. The prompt treats a story covered by several sources as a strong signal of importance: it ranks higher and lists every source. It also prioritizes major model releases, big company and lab news, funding and policy over minor product updates.
 
 ### The ID-mapping design (why links can't be invented)
 
@@ -31,13 +33,25 @@ Each item goes into the prompt as `[id] (source) title` plus a snippet. The mode
 {"tldr": "...", "sections": [{"name": "...", "stories": [{"ids": [3, 17], "headline": "...", "summary": "..."}]}]}
 ```
 
-The code then maps each ID back to the real feed item and attaches *that item's* link and source name. Any ID that isn't an integer in range is logged and ignored; a story left with no valid IDs is dropped. A merged story gets one link per source (for example "Hacker News · Ars Technica"), and its headline links to the first one.
+The code then maps each ID back to the real feed item and attaches *that item's* link and source name. Any ID that isn't an integer in range is logged and ignored; a story left with no valid IDs is dropped. A merged story gets one link per source. Its headline links to the article that pass 2 actually read (falling back to the first direct link), and the email shows that publisher above the headline and the others as "Also covered by …".
 
 ### The "(title only)" anti-hallucination rule
 
 Some feeds carry no real description. Hacker News (hnrss) fills the summary with boilerplate like `Article URL: … Comments URL: … Points: 132 # Comments: 72`. `clean_text` strips HTML tags and that boilerplate (`FEED_BOILERPLATE`) and truncates to 300 characters (or the feed's `snippet_chars`; TLDR AI uses 1500 because one item holds a whole newsletter issue). Google News summaries only repeat the title, so they're dropped. If nothing is left, the item is sent to the model marked **`(title only)`**.
 
 The prompt tells the model to summarize those items using only what the headline says ("HN discussion of …"), and never to add details, causes, numbers or quotes that aren't in the title or snippet. Temperature is `0.2` to keep output conservative.
+
+### Paragraph summaries (pass 2)
+
+After pass 1, `enrich_story` prepares each story:
+
+- **Google News links** (`news.google.com/rss/articles/…`) don't redirect with a plain GET. `decode_google_news` reads the article's signature from Google's page and asks Google's `batchexecute` endpoint for the real URL, the same way the Google News web app does. If that fails, the story uses a direct link from another source that covered it; a Google News link is only used as a last resort.
+- **Which article is read:** the first direct link (not Google News, not a TLDR issue page); if it fails or has under 300 characters of text, the next one. At most two tries per story.
+- **Paywalls and errors:** the story is marked "article unavailable" and pass 2 writes a shorter summary from the headline and feed snippets only.
+
+Pass 2 sends all stories in **one** request, each with its headline, sources, feed snippets and article text. The prompt says to use only facts from that text, never names, numbers, dates, quotes or background from the model's own knowledge, and to leave out "why it matters" rather than guess. The model returns `{"stories": [{"n": 1, "summary": "..."}]}`; a story missing from the reply keeps its pass-1 summary.
+
+**Gemini usage:** a normal run makes **2 requests** (pass 1 + pass 2). Pass 2 uses the same retry chain minus the 5-minute final wait, because a pass-1 digest is already a good fallback.
 
 ### Failure behavior
 
@@ -46,19 +60,34 @@ The prompt tells the model to summarize those items using only what the headline
 | One feed fails (timeout, HTTP error, unparseable) | Logged as `ERROR <feed>: failed, skipping`; the run continues with the other feeds. **No retry.** | 0 |
 | No items at all after fetch + dedupe | Logs `no items at all; nothing to send` and **sends nothing**. | 0 |
 | Gemini error (503, 429, timeout, bad JSON, zero usable stories) | Runs the LLM fallback chain below. If every step fails, the email is sent anyway as a **raw-headlines fallback**: every item grouped by source, under a yellow note saying "The AI summary failed today…". | 0 |
+| Pass 2 fails (all attempts) or articles can't be fetched | Logs `paragraph summaries failed, using short summaries`; the email uses pass 1's 1–2 sentence summaries, with resolved links and images. | 0 |
 | Sending the email fails (bad login, SMTP down) | Logs `sending email failed: …` and exits non-zero so the GitHub run shows **red**. The SMTP connection has a 30s timeout. | 1 |
 
-**LLM fallback chain** (`run_llm_chain`, all values in `config.yaml`):
+**LLM fallback chain** (`run_llm_chain`, used by both passes, all values in `config.yaml`):
 
 1. Primary model (`gemini-3.5-flash`), **60s timeout per request** (`llm_timeout`).
-2. Up to **3 retries** of the primary with exponential backoff of 2s, 4s, 8s (`llm_retries`, `llm_backoff`). Errors 400/401/403/404 skip the remaining retries, since retrying the same model won't help.
+2. Up to **3 retries** of the primary with exponential backoff of 2s, 4s, 8s (`llm_retries`, `llm_backoff`). Errors 400/401/403/404, and a 429 for the **daily** free-tier quota, skip the remaining retries, since retrying the same model won't help.
 3. The lighter model (`gemini-3.5-flash-lite`) **once**.
-4. Wait **5 minutes** (`llm_final_wait`), then the primary one last time.
-5. Only then: the raw-headlines fallback email.
+4. Pass 1 only: wait **5 minutes** (`llm_final_wait`), then the primary one last time.
+5. Only then: the raw-headlines fallback email (pass 1) or the short pass-1 summaries (pass 2).
 
-If the model returns fewer than `min_stories` stories, that counts as a failed attempt, but the short digest is kept and used if nothing better comes back. Every failed attempt logs the exact cause, for example `ERROR LLM attempt 1 (gemini-3.5-flash) failed after 4s: HTTP 503 InternalServerError: [{"error": {"code": 503, "message": "This model is currently experiencing high demand. …"}}]`.
+If the model returns fewer than `min_stories` stories, that counts as a failed attempt, but the short digest is kept and used if nothing better comes back. Every failed attempt logs the exact cause, for example `ERROR LLM pass 1 attempt 1 (gemini-3.5-flash) failed after 4s: HTTP 503 InternalServerError: [{"error": {"code": 503, "message": "This model is currently experiencing high demand. …"}}]`.
 
-**Hard cap:** the whole LLM step finishes within **10 minutes** (`llm_step_cap: 600`) no matter what. The chain shortens the 5-minute wait if needed so the last attempt fits, and a watchdog thread gives up on the step at the cap even if a request hangs and ignores its timeout. Worst case: about 4.5 min of primary attempts, 1 min of Flash-Lite, a wait shortened to about 3.5 min, then 1 min for the final try.
+**Hard cap:** the whole LLM step (pass 1, article fetching and pass 2) finishes within **10 minutes** (`llm_step_cap: 600`) no matter what. If the cap hits after pass 1 succeeded, the email uses the pass-1 digest instead of raw headlines. The chain shortens the 5-minute wait if needed so the last attempt fits, and a watchdog thread gives up on the step at the cap even if a request hangs and ignores its timeout. Worst case: about 4.5 min of primary attempts, 1 min of Flash-Lite, a wait shortened to about 3.5 min, then 1 min for the final try.
+
+### Email design
+
+The layout follows the style of a news-app morning briefing (reference screenshot in `design/reference.png`), without any third-party branding:
+
+- **Header:** small uppercase date, then the big bold "AI Daily News Digest" title, then the TL;DR as a serif standfirst.
+- **Section headers:** small, bold, letter-spaced uppercase labels between a thick rule and a thin rule. "Top stories" is red; other sections are neutral.
+- **Top stories:** the first story is **featured** (full-width image, publisher, large serif headline, sans-serif summary). The rest use a **bold serif lead-in** (the headline) running into the lighter summary text.
+- **Other sections:** publisher above a serif headline with a **square thumbnail** on the right, the paragraph below at full width, thin dividers between stories.
+- **Publisher names** sit above each headline; extra sources are listed under the summary as "Also covered by …".
+
+**Email-safe HTML:** table layout with `table-layout:fixed` (so a large image can never widen the email past a phone screen), all styling inline, system fonts only: `-apple-system`/SF for sans, `ui-serif`/New York (falling back to Georgia) for serif. Light colors are inline; a `<style>` block with `@media (prefers-color-scheme: dark)` and `<meta name="color-scheme" content="light dark">` swaps in a dark palette, which iCloud Mail / Apple Mail on iPhone honor. A `max-width: 480px` media query tightens padding and type on phones.
+
+**Images:** for each story the first working one of: the feed item's `media:content` / `media:thumbnail` / image enclosure / first `<img>` in its HTML (`feed_image`), then the article's `og:image` (read during the article fetch). Every candidate is checked before use (`image_ok`: https, HTTP 200, `Content-Type: image/*`), and a story with no working image simply has no image block, so the email never shows a broken image box.
 
 ---
 
@@ -66,11 +95,12 @@ If the model returns fewer than `min_stories` stories, that counts as a failed a
 
 | Path | Purpose |
 | --- | --- |
-| `digest.py` | The whole pipeline: fetch, filter, dedupe, LLM summary (with retry/fallback chain and hard cap), render, send. Also holds the LLM prompt, the section list, the primary and lite model defaults and the API base URL. |
+| `digest.py` | The whole pipeline: fetch, filter, dedupe, pass 1, article fetching, pass 2 (with retry/fallback chain and hard cap), render, send. Also holds the LLM prompt, the section list, the primary and lite model defaults and the API base URL. |
 | `config.yaml` | Feeds and settings you'll edit most often (see [Configuration](#configuration-how-to-edit)). |
-| `requirements.txt` | Pinned dependencies: `feedparser`, `openai`, `python-dotenv`, `PyYAML`, `requests`. |
+| `requirements.txt` | Pinned dependencies: `feedparser`, `openai`, `python-dotenv`, `PyYAML`, `requests`, `trafilatura` (article text extraction). |
+| `design/` | `reference.png`, the screenshot the email layout is modeled on. Not used at runtime. |
 | `.github/workflows/daily-digest.yml` | The GitHub Actions workflow: primary + backup schedule, skip-if-already-sent guard, Python setup, secrets → env vars, runs `python digest.py`. |
-| `prompts/` | The step-by-step build prompts used to create this project with Claude Code (`prompt_0_brief.md` … `prompt_10_fix_all.md`). History only; nothing reads them at runtime. |
+| `prompts/` | The step-by-step build prompts used to create this project with Claude Code (`prompt_0_brief.md` … `prompt_11_redesign.md`). History only; nothing reads them at runtime. |
 | `.gitignore` | Standard Python template plus `.env`, `.venv` and `.claude/` (local Claude Code settings, not tracked). Keeps secrets and the virtualenv out of git; `__pycache__/` is ignored too. |
 | `digest.html` | Output of the last `--dry-run`. It's committed, so a dry run will show it as modified in `git status`. |
 | `README.md` | This file. |
@@ -128,13 +158,15 @@ The job runs on `ubuntu-latest` with Python 3.13, caches pip, and has a **20-min
 | `settings.lookback_hours` | `26` | How far back to keep items. 26 rather than 24 gives slack for late runs and odd feed timestamps. |
 | `settings.timezone` | `America/Chicago` | Time zone for the date in the subject and email heading. Does **not** control when the workflow runs. |
 | `settings.request_timeout` | `20` | Seconds per feed request. |
+| `settings.article_timeout` | `10` | Seconds per article page, Google News link decode and image check (pass 2 prep). |
+| `settings.article_chars` | `4000` | Article text sent to the LLM per story. |
 | `settings.min_stories` | `10` | Minimum stories in the email whenever enough items exist. |
 | `settings.max_stories` | `15` | Max stories the LLM is asked to pick. |
 | `settings.llm_timeout` | `60` | Seconds per Gemini request (per attempt). |
 | `settings.llm_retries` | `3` | Retries of the primary model. |
 | `settings.llm_backoff` | `2` | Seconds before the first retry; doubles each time (2, 4, 8). |
 | `settings.llm_final_wait` | `300` | Seconds to wait before the last try of the primary model (shortened if needed to fit the cap). |
-| `settings.llm_step_cap` | `600` | Hard cap on the whole LLM step, in seconds. |
+| `settings.llm_step_cap` | `600` | Hard cap on the whole LLM step (both passes and article fetching), in seconds. |
 | `settings.user_agent` | browser UA string | Sent with feed requests; some sites block default Python agents. |
 | `email.subject_prefix` | `AI Daily News Digest` | Subject is `<prefix> — <Weekday, Month Day>`. Also the big heading at the top of the email. |
 | `email.from_name` | `AI News` | Display name on the From line. |
@@ -315,10 +347,13 @@ Open **Actions** → the failed run → the **digest** job → expand **Build an
 | `KeyError: 'SMTP_USER'` (or another name) | A secret is missing or misnamed. Names are case-sensitive and must match the table above exactly. | Add or rename the secret. |
 | `sending email failed: (535, …)` or another auth error | App-specific password revoked or wrong; `SMTP_USER` wrong. | Generate a new app-specific password and update `SMTP_PASSWORD`. |
 | `sending email failed` mentioning the sender address | `EMAIL_FROM` isn't an active alias on the `SMTP_USER` account. | Fix the alias, or delete the `EMAIL_FROM` secret to send from `SMTP_USER`. |
-| `LLM attempt N (…) failed …: HTTP 503` or `HTTP 429` | Gemini overloaded or rate-limited. A later attempt usually succeeds. If all fail, the email goes out as raw headlines and the run stays **green**. | Usually transient. If it happens daily, check your quota in AI Studio or switch `DEFAULT_LLM_MODEL`. |
-| `LLM attempt N (…) failed …: APITimeoutError` | A request hung past the 60s timeout. | Transient; the chain moves on. |
-| `LLM attempt N (…) failed …: HTTP 400`/`401`/`403`/`404` | Bad or revoked `LLM_API_KEY`, or the model name no longer exists. | Rotate the key, or update `DEFAULT_LLM_MODEL` / `DEFAULT_LLM_LITE_MODEL`. |
+| `LLM pass N attempt N (…) failed …: HTTP 503` or `HTTP 429` | Gemini overloaded or rate-limited. A later attempt usually succeeds. If all fail, the email goes out as raw headlines and the run stays **green**. | Usually transient. If it happens daily, check your quota in AI Studio or switch `DEFAULT_LLM_MODEL`. |
+| `LLM pass N attempt N (…) failed …: APITimeoutError` | A request hung past the 60s timeout. | Transient; the chain moves on. |
+| `LLM pass N attempt N (…) failed …: HTTP 400`/`401`/`403`/`404` | Bad or revoked `LLM_API_KEY`, or the model name no longer exists. | Rotate the key, or update `DEFAULT_LLM_MODEL` / `DEFAULT_LLM_LITE_MODEL`. |
 | `LLM summary failed … LLM step hit the 600s hard cap` | Every attempt hung; the watchdog stopped the step and sent raw headlines. | Transient Gemini outage; no action unless it repeats. |
+| `429 … Generate content requests per day limit exceeded` | The free tier's 20 requests/day for that model is used up (usually from many manual test runs). The chain skips straight to Flash-Lite. | Wait for the daily reset; avoid many test runs in one day. |
+| `paragraph summaries failed, using short summaries` | Pass 2 failed on every attempt. The email still has the pass-1 short summaries. | Transient; no action unless it repeats. |
+| `article fetch failed for <url>` / `could not resolve Google News link` | A paywall, block or timeout on one article. That story gets a shorter snippet-based summary. | None; normal for a few stories a day. |
 | `A successful run already finished today …; skipping.` | Normal for the backup run when the primary already sent. | None. |
 | `ERROR <feed>: failed, skipping (…)` | One feed is down, moved, or blocking the request. The run continues and stays green. | If it repeats for days, fix or remove the URL in `config.yaml`. |
 | `Error: The operation was canceled` after 20 minutes | Hit `timeout-minutes: 20`. Shouldn't happen, since the LLM step is capped at 10 minutes. | Rerun, and check which step was slow. |
@@ -347,6 +382,6 @@ The repo is currently private. In a **public** repository, GitHub automatically 
 
 ### Cost
 
-- **Gemini:** usually one or two requests per day (more on bad days, at most six), well within the Gemini API free tier. Free-tier limits and model availability change over time; check AI Studio if you start seeing 429s.
+- **Gemini:** 2 requests per day on a normal run (pass 1 + pass 2; at most 11 on a very bad day). The free tier allows **20 requests per day per model**, so a manual test run or two is fine, but many test runs in one day will hit `429 … PerDay` and fall back to Flash-Lite until the quota resets. Free-tier limits and model availability change over time; check AI Studio if you start seeing 429s.
 - **GitHub Actions:** a normal run takes a minute or two, and the backup run usually skips in a few seconds. A run where Gemini is down can take about 12 minutes because of the 10-minute LLM cap. Public repos get free minutes on standard runners; private repos draw from the account's monthly included minutes (2,000 on the Free plan), so a daily run uses only a small fraction.
 - **iCloud Mail:** included with your Apple account.

@@ -2,6 +2,7 @@
 
 import argparse
 import calendar
+import copy
 import html
 import json
 import logging
@@ -11,15 +12,17 @@ import smtplib
 import ssl
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formataddr
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import feedparser
 import requests
+import trafilatura
 import yaml
 from dotenv import load_dotenv
 import openai
@@ -55,6 +58,20 @@ Return ONLY JSON in this exact shape:
 Items:
 {items}"""
 
+SUMMARY_PROMPT = """You are writing the story summaries for a daily AI news digest read by a CS grad student / software engineer.
+
+For each numbered story below, write ONE paragraph:
+- If ARTICLE TEXT is given: 4-6 sentences covering what happened, the key details and numbers, and why it matters.
+- If the article text is unavailable: 1-3 sentences using only the headline and feed items. Do not pad it.
+- Use ONLY facts stated in that story's article text, feed items and headline. Never add names, numbers, dates, quotes, causes or background from your own knowledge.
+- "Why it matters" must follow from what the text says; if the text gives no reason, leave it out rather than guess.
+- Plain, neutral, factual prose. No bullet points, no hype, no "the article says".
+
+Return ONLY JSON in this exact shape, one entry per story:
+{{"stories": [{{"n": 1, "summary": "..."}}]}}
+
+{stories}"""
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("digest")
 
@@ -86,6 +103,22 @@ def fetch_issue_stories(url, settings):
         blurb = clean_text(rest.split("<h", 1)[0], 160)
         stories.append(f"{title}: {blurb}")
     return " | ".join(stories)
+
+
+IMG_TAG = re.compile(r'<img[^>]+src="([^"]+)"', re.I)
+
+
+def feed_image(entry):
+    """The entry's image from media:content, media:thumbnail, an enclosure or an <img> in its HTML."""
+    for media in entry.get("media_content", []) + entry.get("media_thumbnail", []):
+        if media.get("url") and media.get("medium", "image") == "image":
+            return media["url"]
+    for link in entry.get("links", []):
+        if link.get("rel") == "enclosure" and link.get("type", "").startswith("image/"):
+            return link["href"]
+    body = entry.get("summary", "") + "".join(c.get("value", "") for c in entry.get("content", []))
+    match = IMG_TAG.search(body)
+    return html.unescape(match.group(1)) if match else ""
 
 
 def fetch_feed(feed, settings, cutoff):
@@ -132,6 +165,7 @@ def fetch_feed(feed, settings, cutoff):
             "link": entry.get("link", ""),
             "summary": summary,
             "snippet_chars": feed.get("snippet_chars", 300),
+            "image": feed_image(entry),
             "published": published,
         })
     if undated:
@@ -213,17 +247,9 @@ def build_prompt(items, settings):
     )
 
 
-def request_digest(client, model, prompt, items, timeout):
-    """One LLM request; returns the digest with real links attached by ID."""
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        temperature=0.2,
-        timeout=timeout,
-    )
-    data = json.loads(resp.choices[0].message.content)
-
+def parse_digest(content, items):
+    """Pass-1 JSON -> digest; real links and items are attached by ID."""
+    data = json.loads(content)
     sections = []
     for section in data.get("sections", []):
         stories = []
@@ -240,6 +266,8 @@ def request_digest(client, model, prompt, items, timeout):
                 "summary": story.get("summary", "").strip(),
                 "url": links[0]["url"],
                 "links": links,
+                "ids": ids,
+                "image": "",
             })
         if stories:
             sections.append({"name": section.get("name", ""), "stories": stories})
@@ -256,9 +284,12 @@ def describe_error(e):
     return f"{type(e).__name__}: {e}"
 
 
-def run_llm_chain(items, settings, deadline):
-    """Primary model with retries, then the lite model once, then the primary after a long wait."""
-    prompt = build_prompt(items, settings)
+def run_llm_chain(prompt, parse, settings, deadline, label, final_try=True, count=None, want=0):
+    """Primary model with retries, then the lite model once, then (optionally) the primary after a long wait.
+
+    parse(content) turns the model's reply into a result or raises. If count(result) < want, the result
+    is kept as a fallback and the chain keeps trying for a better one.
+    """
     timeout = settings["llm_timeout"]
     client = OpenAI(api_key=os.environ["LLM_API_KEY"], base_url=LLM_BASE_URL, max_retries=0, timeout=timeout)
     primary = os.environ.get("LLM_MODEL") or DEFAULT_LLM_MODEL
@@ -266,59 +297,211 @@ def run_llm_chain(items, settings, deadline):
 
     attempts = [(primary, 0)]
     attempts += [(primary, settings["llm_backoff"] * 2**i) for i in range(settings["llm_retries"])]
-    attempts += [(lite, 0), (primary, settings["llm_final_wait"])]
-    min_stories = min(settings["min_stories"], len(items))
+    attempts += [(lite, 0)]
+    if final_try:
+        attempts += [(primary, settings["llm_final_wait"])]
     dead_models, short, last_error = set(), None, None
 
     for n, (model, wait) in enumerate(attempts, 1):
-        final = n == len(attempts)
+        final = final_try and n == len(attempts)
         if model in dead_models or (final and short):
             continue
         if final:
             # Shorten the long wait so the last attempt still gets a full timeout before the cap.
             wait = min(wait, deadline - time.monotonic() - timeout)
         if wait > 0:
-            log.info("LLM: waiting %ds before attempt %d", wait, n)
+            log.info("LLM %s: waiting %ds before attempt %d", label, wait, n)
             time.sleep(wait)
         remaining = deadline - time.monotonic()
         if remaining < 1:
             break
         started = time.monotonic()
         try:
-            digest = request_digest(client, model, prompt, items, min(timeout, remaining))
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.2,
+                timeout=min(timeout, remaining),
+            )
+            result = parse(resp.choices[0].message.content)
         except Exception as e:
             last_error = e
-            log.error("LLM attempt %d (%s) failed after %.0fs: %s", n, model, time.monotonic() - started, describe_error(e))
-            if isinstance(e, openai.APIStatusError) and e.status_code in NO_RETRY_STATUSES:
+            log.error("LLM %s attempt %d (%s) failed after %.0fs: %s",
+                      label, n, model, time.monotonic() - started, describe_error(e))
+            if isinstance(e, openai.APIStatusError) and (
+                    e.status_code in NO_RETRY_STATUSES
+                    or (e.status_code == 429 and "PerDay" in json.dumps(e.body))):  # daily quota: retrying won't help
                 dead_models.add(model)
             continue
-        count = sum(len(s["stories"]) for s in digest["sections"])
-        log.info("LLM attempt %d (%s) succeeded in %.0fs with %d stories", n, model, time.monotonic() - started, count)
-        if count >= min_stories:
-            return digest
-        log.warning("LLM returned only %d stories (want %d); trying again", count, min_stories)
-        short = digest
+        got = count(result) if count else want
+        log.info("LLM %s attempt %d (%s) succeeded in %.0fs (%d)", label, n, model, time.monotonic() - started, got)
+        if got >= want:
+            return result
+        log.warning("LLM %s returned only %d (want %d); trying again", label, got, want)
+        short = result
     if short:
         return short
-    raise last_error or TimeoutError("LLM step ran out of time")
+    raise last_error or TimeoutError(f"LLM {label} ran out of time")
+
+
+def story_count(digest):
+    return sum(len(s["stories"]) for s in digest["sections"])
+
+
+def decode_google_news(url, settings):
+    """Resolve a news.google.com/rss/articles/… redirect to the publisher's URL, or return None."""
+    headers = {"User-Agent": settings["user_agent"]}
+    try:
+        article_id = urlsplit(url).path.rstrip("/").split("/")[-1]
+        page = requests.get(f"https://news.google.com/rss/articles/{article_id}", headers=headers,
+                            timeout=settings["article_timeout"]).text
+        sig = re.search(r'data-n-a-sg="([^"]+)"', page)
+        ts = re.search(r'data-n-a-ts="([^"]+)"', page)
+        if not (sig and ts):
+            return None
+        payload = ["garturlreq", [["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1, None, None, None,
+                                   None, None, 0, 1], "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0],
+                   article_id, int(ts.group(1)), sig.group(1)]
+        resp = requests.post(
+            "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+            headers={**headers, "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
+            data={"f.req": json.dumps([[["Fbv4je", json.dumps(payload), None, "generic"]]])},
+            timeout=settings["article_timeout"],
+        )
+        decoded = json.loads(json.loads(resp.text.split("\n\n")[1])[0][2])[1]
+        return decoded if decoded.startswith("http") else None
+    except Exception as e:
+        log.warning("could not resolve Google News link (%s)", type(e).__name__)
+        return None
+
+
+def fetch_article(url, settings):
+    """Main text (trimmed) and og:image of an article page."""
+    resp = requests.get(url, timeout=settings["article_timeout"], headers={"User-Agent": settings["user_agent"]})
+    resp.raise_for_status()
+    text = trafilatura.extract(resp.text, url=url, include_comments=False, include_tables=False) or ""
+    meta = trafilatura.extract_metadata(resp.text)
+    image = urljoin(url, meta.image) if meta and meta.image else ""
+    return text[: settings["article_chars"]], image
+
+
+def image_ok(url, settings):
+    """True if the URL is https and really serves an image, so the email never shows a broken box."""
+    if not url.startswith("https://"):
+        return False
+    try:
+        with requests.get(url, stream=True, timeout=settings["article_timeout"],
+                          headers={"User-Agent": settings["user_agent"]}) as resp:
+            return resp.ok and resp.headers.get("Content-Type", "").startswith("image/")
+    except Exception:
+        return False
+
+
+def is_google_news(url):
+    return urlsplit(url).netloc.endswith("news.google.com")
+
+
+def enrich_story(story, items, settings):
+    """Resolve Google News links, fetch the best article's text, and pick a working image."""
+    for link in story["links"]:
+        if is_google_news(link["url"]):
+            link["url"] = decode_google_news(link["url"], settings) or link["url"]
+    # A link still pointing at Google News (or a TLDR issue page) is a last resort.
+    direct = [l for l in story["links"] if not is_google_news(l["url"]) and "tldr.tech" not in l["url"]]
+    story["url"] = (direct or story["links"])[0]["url"]
+
+    article, og_image = None, ""
+    for link in direct[:2]:
+        try:
+            text, og_image = fetch_article(link["url"], settings)
+        except Exception as e:
+            log.warning("article fetch failed for %s (%s)", link["url"], type(e).__name__)
+            continue
+        if len(text) >= 300:
+            article = {"source": link["source"], "url": link["url"], "text": text}
+            story["url"] = link["url"]
+            break
+    story["article"] = article
+
+    candidates = [items[i]["image"] for i in story["ids"] if items[i]["image"]] + [og_image]
+    story["image"] = next((u for u in candidates if u and image_ok(u, settings)), "")
+    return story
+
+
+def build_summary_prompt(stories, items):
+    blocks = []
+    for n, story in enumerate(stories, 1):
+        lines = [f"=== Story {n} ===", f"Headline: {story['headline']}",
+                 "Sources: " + ", ".join(dict.fromkeys(l["source"] for l in story["links"]))]
+        for i in story["ids"]:
+            snippet = clean_text(items[i]["summary"], items[i]["snippet_chars"])
+            lines.append(f"Feed item ({items[i]['source']}): {items[i]['title']}" + (f" | {snippet}" if snippet else ""))
+        if story["article"]:
+            lines.append(f"ARTICLE TEXT ({story['article']['source']}):\n{story['article']['text']}")
+        else:
+            lines.append("ARTICLE TEXT: unavailable (use only the headline and feed items above)")
+        blocks.append("\n".join(lines))
+    return SUMMARY_PROMPT.format(stories="\n\n".join(blocks))
+
+
+def parse_summaries(content, n_stories):
+    data = json.loads(content)
+    summaries = {}
+    for s in data.get("stories", []):
+        n, text = s.get("n"), (s.get("summary") or "").strip()
+        if isinstance(n, int) and 1 <= n <= n_stories and text:
+            summaries[n] = text
+    if not summaries:
+        raise ValueError("model returned no usable summaries")
+    return summaries
 
 
 def summarize(items, settings):
-    """Run the LLM chain under a hard time cap, whatever the HTTP client does."""
+    """Pass 1 picks stories, then articles are fetched, then pass 2 writes paragraphs; all under a hard cap.
+
+    If anything after pass 1 fails or the cap hits, the pass-1 digest (short summaries) is still used.
+    """
     cap = settings["llm_step_cap"]
     result = {}
 
     def run():
+        # Stop a few seconds early so the chain normally ends on its own, before the watchdog.
+        deadline = time.monotonic() + cap - 5
         try:
-            # Stop a few seconds early so the chain normally ends on its own, before the watchdog.
-            result["digest"] = run_llm_chain(items, settings, time.monotonic() + cap - 5)
+            digest = run_llm_chain(build_prompt(items, settings), lambda c: parse_digest(c, items), settings,
+                                   deadline, "pass 1", count=story_count,
+                                   want=min(settings["min_stories"], len(items)))
         except Exception as e:
             result["error"] = e
+            return
+        result["digest"] = digest
+        try:
+            full = copy.deepcopy(digest)
+            stories = [s for section in full["sections"] for s in section["stories"]]
+            started = time.monotonic()
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                list(pool.map(lambda s: enrich_story(s, items, settings), stories))
+            log.info("articles: fetched %d/%d, images %d/%d in %.0fs",
+                     sum(1 for s in stories if s["article"]), len(stories),
+                     sum(1 for s in stories if s["image"]), len(stories), time.monotonic() - started)
+            result["digest"] = full  # links resolved and images found, even if pass 2 fails
+            summaries = run_llm_chain(build_summary_prompt(stories, items), lambda c: parse_summaries(c, len(stories)),
+                                      settings, deadline, "pass 2", final_try=False, count=len, want=len(stories))
+            final = copy.deepcopy(full)
+            for n, story in enumerate((s for section in final["sections"] for s in section["stories"]), 1):
+                story["summary"] = summaries.get(n, story["summary"])
+            result["digest"] = final
+        except Exception as e:
+            log.error("paragraph summaries failed, using short summaries (%s)", describe_error(e))
 
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
     worker.join(cap)
     if worker.is_alive():
+        if "digest" in result:
+            log.error("LLM step hit the %ds hard cap; using what was ready", cap)
+            return result["digest"]
         raise TimeoutError(f"LLM step hit the {cap}s hard cap")
     if "error" in result:
         raise result["error"]
@@ -330,7 +513,7 @@ def fallback_digest(items):
     by_source = {}
     for item in items:
         by_source.setdefault(item["source"], []).append(
-            {"headline": item["title"], "summary": "", "url": item["link"], "links": []}
+            {"headline": item["title"], "summary": "", "url": item["link"], "links": [], "image": ""}
         )
     return {
         "tldr": "",
@@ -339,57 +522,138 @@ def fallback_digest(items):
     }
 
 
-FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+SANS = "-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+SERIF = "ui-serif,'New York',Charter,Georgia,'Times New Roman',serif"
+
+# Light colors are inline; the <style> block swaps them for dark mode (iCloud Mail / Apple Mail honor it).
+DARK_CSS = """
+:root { color-scheme: light dark; supported-color-schemes: light dark; }
+@media (prefers-color-scheme: dark) {
+  .bg { background-color: #1c1c1e !important; }
+  .t1 { color: #f5f5f7 !important; }
+  .t2 { color: #c7c7cc !important; }
+  .t3 { color: #98989d !important; }
+  .red { color: #ff375f !important; }
+  .rule { border-color: #3a3a3c !important; }
+  .rule-strong { border-color: #636366 !important; }
+  .note { background-color: #3a2e05 !important; color: #ffd60a !important; }
+}
+@media (max-width: 480px) {
+  .px { padding-left: 20px !important; padding-right: 20px !important; }
+  .title { font-size: 32px !important; }
+  .thumb { width: 76px !important; height: 76px !important; }
+}
+"""
 
 
 def render_html(digest, title, heading, date_label):
     e = html.escape
     rows = []
-    if digest["note"]:
-        rows.append(
-            f'<tr><td style="padding:0 24px 20px;"><div style="background:#fef3c7;border-radius:6px;'
-            f'padding:12px 14px;font-family:{FONT};font-size:14px;line-height:1.5;color:#78350f;">'
-            f'{e(digest["note"])}</div></td></tr>'
+
+    def row(content, pad="0 0 0 0", cls="px"):
+        rows.append(f'<tr><td class="{cls}" style="padding:{pad};">{content}</td></tr>')
+
+    def primary(story):
+        """The link the headline points to (pass 2 may have switched to another source's article)."""
+        return next((l for l in story["links"] if l["url"] == story["url"]), story["links"][0])
+
+    def kicker(story):
+        if not story["links"]:
+            return ""
+        return (f'<div class="t3" style="font-family:{SANS};font-size:13px;font-weight:600;letter-spacing:0.01em;'
+                f'color:#6e6e73;margin:0 0 6px;">{e(primary(story)["source"])}</div>')
+
+    def more_coverage(story):
+        if not story["links"]:
+            return ""
+        main = primary(story)["source"]
+        others = list({l["source"]: l for l in story["links"] if l["source"] != main}.values())
+        if not others:
+            return ""
+        links = " &middot; ".join(
+            f'<a href="{e(l["url"])}" class="t3" style="color:#6e6e73;text-decoration:underline;">{e(l["source"])}</a>'
+            for l in others
         )
+        return (f'<div class="t3" style="font-family:{SANS};font-size:13px;line-height:1.5;color:#6e6e73;'
+                f'margin-top:10px;">Also covered by {links}</div>')
+
+    def headline_link(story, size, weight="700"):
+        return (f'<a href="{e(story["url"])}" class="t1" style="font-family:{SERIF};font-size:{size}px;'
+                f'font-weight:{weight};line-height:1.25;color:#1d1d1f;text-decoration:none;">{e(story["headline"])}</a>')
+
+    def summary_div(story, color="#3a3a3c", font=SERIF, size=16):
+        if not story["summary"]:
+            return ""
+        return (f'<div class="t2" style="font-family:{font};font-size:{size}px;line-height:1.5;color:{color};'
+                f'margin-top:6px;">{e(story["summary"])}</div>')
+
+    def divider(strong=False):
+        cls, width, color = ("rule-strong", 3, "#d2d2d7") if strong else ("rule", 1, "#e5e5ea")
+        return (f'<tr><td class="px" style="padding:0 24px;"><div class="{cls}" style="border-top:{width}px solid '
+                f'{color};font-size:0;line-height:0;">&nbsp;</div></td></tr>')
+
+    # Header: date kicker, big title, the day in brief.
+    row(f'<div class="t3" style="font-family:{SANS};font-size:13px;font-weight:700;letter-spacing:0.06em;'
+        f'text-transform:uppercase;color:#6e6e73;">{e(date_label)}</div>'
+        f'<div class="t1 title" style="font-family:{SANS};font-size:36px;font-weight:800;line-height:1.08;'
+        f'letter-spacing:-0.02em;color:#1d1d1f;margin-top:4px;">{e(heading)}</div>', "32px 24px 18px")
     if digest["tldr"]:
-        rows.append(
-            f'<tr><td style="padding:0 24px 20px;"><div style="background:#f3f4f6;border-radius:6px;'
-            f'padding:14px 16px;font-family:{FONT};font-size:15px;line-height:1.55;color:#1f2937;">'
-            f'<strong>TL;DR</strong> {e(digest["tldr"])}</div></td></tr>'
-        )
-    for section in digest["sections"]:
-        rows.append(
-            f'<tr><td style="padding:12px 24px 10px;font-family:{FONT};font-size:12px;font-weight:700;'
-            f'letter-spacing:0.08em;text-transform:uppercase;color:#2563eb;'
-            f'border-top:1px solid #e5e7eb;">{e(section["name"])}</td></tr>'
-        )
-        for story in section["stories"]:
-            parts = [
-                f'<a href="{e(story["url"])}" style="font-size:16px;font-weight:600;line-height:1.35;'
-                f'color:#111827;text-decoration:none;">{e(story["headline"])}</a>'
-            ]
-            if story["summary"]:
-                parts.append(
-                    f'<div style="margin-top:4px;font-size:15px;line-height:1.5;color:#374151;">'
-                    f'{e(story["summary"])}</div>'
-                )
-            if story["links"]:
-                links = " &middot; ".join(
-                    f'<a href="{e(l["url"])}" style="color:#2563eb;text-decoration:none;">{e(l["source"])}</a>'
-                    for l in story["links"]
-                )
-                parts.append(f'<div style="margin-top:6px;font-size:13px;color:#6b7280;">{links}</div>')
-            rows.append(f'<tr><td style="padding:0 24px 18px;font-family:{FONT};">{"".join(parts)}</td></tr>')
+        row(f'<div class="t2" style="font-family:{SERIF};font-size:17px;line-height:1.5;color:#3a3a3c;">'
+            f'{e(digest["tldr"])}</div>', "0 24px 22px")
+    if digest["note"]:
+        row(f'<div class="note" style="background-color:#fff4d6;border-radius:8px;padding:12px 14px;font-family:{SANS};'
+            f'font-size:14px;line-height:1.5;color:#7a4f00;">{e(digest["note"])}</div>', "0 24px 22px")
+
+    for s_idx, section in enumerate(digest["sections"]):
+        top = s_idx == 0 and section["name"] == "Top stories"
+        rows.append(divider(strong=True))
+        color, cls = ("#d70015", "red") if top else ("#1d1d1f", "t1")
+        row(f'<div class="{cls}" style="font-family:{SANS};font-size:14px;font-weight:800;letter-spacing:0.16em;'
+            f'text-transform:uppercase;color:{color};">{e(section["name"])}</div>', "14px 24px 14px")
+
+        for i, story in enumerate(section["stories"]):
+            rows.append(divider())
+            if top and i == 0:
+                # Featured story: big image, large serif headline, sans summary.
+                img = (f'<a href="{e(story["url"])}"><img src="{e(story["image"])}" width="552" alt="" '
+                       f'style="display:block;width:100%;max-width:552px;height:auto;border:0;border-radius:6px;'
+                       f'margin-bottom:14px;"></a>') if story["image"] else ""
+                row(img + kicker(story) + headline_link(story, 26)
+                    + summary_div(story, color="#6e6e73", font=SANS, size=16).replace('class="t2"', 'class="t3"')
+                    + more_coverage(story), "18px 24px 20px")
+            elif top:
+                # Top stories: bold serif lead-in running into lighter text, like a news brief.
+                body = (f'<a href="{e(story["url"])}" class="t1" style="font-family:{SERIF};font-size:19px;'
+                        f'font-weight:700;line-height:1.42;color:#1d1d1f;text-decoration:none;">{e(story["headline"])}.</a>')
+                if story["summary"]:
+                    body += (f' <span class="t3" style="font-family:{SERIF};font-size:19px;line-height:1.42;'
+                             f'color:#6e6e73;">{e(story["summary"])}</span>')
+                row(kicker(story) + f'<div style="line-height:1.42;">{body}</div>' + more_coverage(story),
+                    "16px 24px 18px")
+            else:
+                # Section list: headline with a thumbnail on the right, paragraph below.
+                thumb = ""
+                if story["image"]:
+                    thumb = (f'<td width="88" valign="top" style="padding-left:14px;"><a href="{e(story["url"])}">'
+                             f'<img class="thumb" src="{e(story["image"])}" width="88" height="88" alt="" '
+                             f'style="display:block;width:88px;height:88px;object-fit:cover;border:0;border-radius:6px;">'
+                             f'</a></td>')
+                top_row = (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+                           f'style="table-layout:fixed;"><tr>'
+                           f'<td valign="top">{kicker(story)}{headline_link(story, 20)}</td>{thumb}</tr></table>')
+                row(top_row + summary_div(story) + more_coverage(story), "16px 24px 18px")
+    rows.append(divider(strong=True))
+    row(f'<div class="t3" style="font-family:{SANS};font-size:12px;line-height:1.5;color:#6e6e73;">'
+        f'Picked and summarized by AI from the day\'s feeds. Tap a headline to read the full story.</div>',
+        "14px 24px 32px")
 
     return f"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{e(title)}</title></head>
-<body style="margin:0;padding:0;background:#f4f4f5;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;"><tr><td align="center" style="padding:24px 12px;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;background:#ffffff;border-radius:8px;">
-<tr><td style="padding:28px 24px 18px;font-family:{FONT};">
-<div style="font-size:22px;font-weight:700;color:#111827;">{e(heading)}</div>
-<div style="margin-top:2px;font-size:14px;color:#6b7280;">{e(date_label)}</div>
-</td></tr>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark"><meta name="supported-color-schemes" content="light dark">
+<title>{e(title)}</title><style>{DARK_CSS}</style></head>
+<body class="bg" style="margin:0;padding:0;background-color:#ffffff;-webkit-text-size-adjust:100%;word-wrap:break-word;overflow-wrap:break-word;">
+<table role="presentation" class="bg" width="100%" cellpadding="0" cellspacing="0" style="background-color:#ffffff;"><tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;table-layout:fixed;">
 {chr(10).join(rows)}
 </table>
 </td></tr></table>
