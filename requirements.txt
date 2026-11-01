@@ -3,3 +3,4 @@ openai==3.41.0
 python-dotenv==1.2.4
 PyYAML==6.0.3
 requests==2.34.2
+trafilatura==2.3.1
