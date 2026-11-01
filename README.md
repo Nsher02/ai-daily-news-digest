@@ -101,7 +101,8 @@ The layout follows the style of a news-app morning briefing (reference screensho
 | `config.yaml` | Feeds and settings you'll edit most often (see [Configuration](#configuration-how-to-edit)). |
 | `requirements.txt` | Pinned dependencies: `feedparser`, `openai`, `python-dotenv`, `PyYAML`, `requests`, `trafilatura` (article text extraction). |
 | `design/` | `reference.png`, the screenshot the email layout is modeled on. Not used at runtime. |
-| `.github/workflows/daily-digest.yml` | The GitHub Actions workflow: primary + backup schedule, skip-if-already-sent guard, Python setup, secrets → env vars, runs `python digest.py`. |
+| `.github/workflows/daily-digest.yml` | The GitHub Actions workflow: UTC morning crons, send-window check, Python setup, secrets → env vars, runs `python digest.py`, emails you if a run fails. |
+| `send_window.py` | Decides whether a scheduled run sends: inside 7:45–10:00 AM Chicago and nothing sent yet today. Standard library only. |
 | `prompts/` | The step-by-step build prompts used to create this project with Claude Code (`prompt_0_brief.md` … `prompt_11_redesign.md`). History only; nothing reads them at runtime. |
 | `.gitignore` | Standard Python template plus `.env`, `.venv` and `.claude/` (local Claude Code settings, not tracked). Keeps secrets and the virtualenv out of git; `__pycache__/` is ignored too. |
 | `digest.html` | Output of the last `--dry-run`. It's committed, so a dry run will show it as modified in `git status`. |
@@ -111,41 +112,35 @@ The layout follows the style of a news-app morning briefing (reference screensho
 
 ## Schedule
 
-The workflow has a **primary** and a **backup** scheduled run, both in America/Chicago time:
+The digest goes out at about **7:53 AM Chicago time** every morning, with retries until 10:00 AM. The crons are plain **UTC**:
 
 ```yaml
 on:
   schedule:
-    - cron: "53 7 * * *" # primary: 7:53 AM Central
-      timezone: "America/Chicago"
-    - cron: "23 8 * * *" # backup: 8:23 AM Central
-      timezone: "America/Chicago"
+    - cron: "53 12,13,14 * * *"
+    - cron: "23 12,13,14 * * *"
   workflow_dispatch:
 ```
 
-Both times are deliberately **off the top of the hour**. GitHub is busiest at :00 and drops or delays scheduled runs then (the old `0 8 * * *` schedule once never fired at all).
+That is six firings a day: 12:23 to 14:53 UTC. In CDT (UTC-5) they land at 7:23 to 9:53 AM, and in CST (UTC-6) at 6:23 to 8:53 AM, so 7:53 AM Chicago is always one of them. The first step, **Check send window** ([`send_window.py`](send_window.py)), drops the rest:
 
-**Skip guard:** scheduled runs inspect recent workflow job steps for a successful `SMTP accepted: YYYY-MM-DD` receipt matching today's America/Chicago date. Only `send_email` returning successfully produces that receipt. Generic successful runs, empty feeds, skipped runs, dry runs and failed sends do not suppress the backup. Run/job listings are paginated; API failures fail the guard rather than silently risking a duplicate. Manual runs always send, and concurrency serializes primary and backup runs. The script exposes `sent`, `no_items`, `failed`, or `dry_run` through Actions outputs.
+- The current America/Chicago time must be between **7:45 and 10:00 AM**. Otherwise the run logs `Skipping: … outside the 07:45-10:00 Chicago send window` and stops. This is how DST is handled. The workflow no longer uses GitHub's cron `timezone:` field, because scheduled runs with it were missing or hours late.
+- **Nothing may have been sent yet today** (Chicago date). A run counts as sent only if it has a successful `SMTP accepted: YYYY-MM-DD` step for today, and only `send_email` returning successfully produces that step. Scheduled and manual sends both count, **except manual runs started before 7:45 AM**, so an early test run doesn't block the morning email. Empty feeds, dry runs, failed sends and skipped runs never count.
+- **Manual runs** (Actions → Run workflow) skip the check and always send.
 
-SMTP acceptance does not prove inbox delivery. A runner crash between SMTP acceptance and recording the receipt can still cause a duplicate on retry; SMTP offers no atomic transaction with GitHub's run metadata. Existing runs from before this change have no receipt.
+Run and job listings are paginated. If the GitHub API call fails, the step fails instead of risking a duplicate, and the failure alert below fires. Concurrency serializes runs, so a delayed run waits for the previous one and then sees its receipt. The script exposes `sent`, `no_items`, `failed`, or `dry_run` through Actions outputs.
 
-The `timezone` field takes an IANA name and GitHub handles daylight saving, so the times stay local all year. Without `timezone`, cron times are UTC.
+SMTP acceptance does not prove inbox delivery. A runner crash between SMTP acceptance and recording the receipt can still cause a duplicate on the next firing. SMTP offers no atomic transaction with GitHub's run metadata.
 
-**To change the time or time zone**, edit both places so the email date matches the send time:
+**Failure alert:** if any step fails, a final step emails you "AI Daily News Digest failed – check GitHub Actions" with a link to the run, using the same SMTP secrets. If the SMTP secrets themselves are broken, only GitHub's own failure notification reaches you.
 
-1. `.github/workflows/daily-digest.yml`: both `cron` entries (minute hour), their `timezone`, and the `TZ=America/Chicago` used by the skip guard. Example for 6:37 AM Pacific with a 7:07 backup:
-   ```yaml
-       - cron: "37 6 * * *"
-         timezone: "America/Los_Angeles"
-       - cron: "7 7 * * *"
-         timezone: "America/Los_Angeles"
-   ```
-2. `config.yaml`: `settings.timezone` (used for the date in the subject and heading):
-   ```yaml
-     timezone: America/Los_Angeles
-   ```
+**To change the time or time zone**, edit three places:
 
-**Runs can start late.** GitHub queues scheduled runs and they often start several minutes (sometimes much more) after the cron time; under heavy load a run can be skipped entirely, which is what the backup run is for. Keep both times off the top of the hour. Scheduled runs only fire from the default branch (`main`).
+1. `.github/workflows/daily-digest.yml`: the UTC crons. Pick hours that cover your target local time in both standard and daylight time.
+2. `send_window.py`: `TZ`, `WINDOW_START` and `WINDOW_END`.
+3. `config.yaml`: `settings.timezone` (used for the date in the subject and heading, and in the receipt step's name).
+
+**Runs can start late.** GitHub queues scheduled runs, and they often start several minutes (sometimes much more) after the cron time. Under heavy load a firing can be dropped entirely, which is why there are six. All times are off the top of the hour, when GitHub is busiest. Scheduled runs only fire from the default branch (`main`).
 
 **Manual run:** GitHub → **Actions** → **AI Daily News Digest** → **Run workflow** → branch `main` → **Run workflow**. This sends a real email.
 
@@ -344,7 +339,7 @@ Logs go to stderr as `LEVEL message`. The `openai` package logs one `INFO HTTP R
 
 ### A red Actions run
 
-Open **Actions** → the failed run → the **digest** job → expand **Build and send digest** (or **Install dependencies** if it failed earlier). Errors are lines starting with `ERROR`, or a Python traceback at the end. GitHub also emails you about failed scheduled runs by default.
+Open **Actions** → the failed run → the **digest** job → expand **Build and send digest** (or **Install dependencies** if it failed earlier). Errors are lines starting with `ERROR`, or a Python traceback at the end. The workflow also emails you "AI Daily News Digest failed – check GitHub Actions" when any step fails.
 
 | Symptom in the log | Likely cause | Fix |
 | --- | --- | --- |
@@ -358,7 +353,8 @@ Open **Actions** → the failed run → the **digest** job → expand **Build an
 | `429 … Generate content requests per day limit exceeded` | The free tier's 20 requests/day for that model is used up (usually from many manual test runs). The chain skips straight to Flash-Lite. | Wait for the daily reset; avoid many test runs in one day. |
 | `paragraph summaries failed, using short summaries` | Pass 2 failed on every attempt. The email still has the pass-1 short summaries. | Transient; no action unless it repeats. |
 | `article fetch failed for <url>` / `could not resolve Google News link` | A paywall, block or timeout on one article. That story gets a shorter snippet-based summary. | None; normal for a few stories a day. |
-| `Today's digest was accepted by SMTP; skipping.` | Normal for the backup run when the primary already sent. | None. |
+| `Skipping: today's digest was already sent by run …` | Normal for the later morning firings after the first one sent. | None. |
+| `Skipping: … outside the 07:45-10:00 Chicago send window` | Normal for the firings that land before 7:45 AM (and after 10:00 AM). | None. |
 | `ERROR <feed>: failed, skipping (…)` | One feed is down, moved, or blocking the request. The run continues and stays green. | If it repeats for days, fix or remove the URL in `config.yaml`. |
 | `Error: The operation was canceled` after 20 minutes | Hit `timeout-minutes: 20`. Shouldn't happen, since the LLM step is capped at 10 minutes. | Rerun, and check which step was slow. |
 
@@ -387,13 +383,13 @@ The repo is currently private. In a **public** repository, GitHub automatically 
 ### Cost
 
 - **Gemini:** 2 requests per day on a normal run (pass 1 + pass 2; at most 11 on a very bad day). The free tier allows **20 requests per day per model**, so a manual test run or two is fine, but many test runs in one day will hit `429 … PerDay` and fall back to Flash-Lite until the quota resets. Free-tier limits and model availability change over time; check AI Studio if you start seeing 429s.
-- **GitHub Actions:** a normal run takes a minute or two, and the backup run usually skips in a few seconds. A run where Gemini is down can take about 12 minutes because of the 10-minute LLM cap. Public repos get free minutes on standard runners; private repos draw from the account's monthly included minutes (2,000 on the Free plan), so a daily run uses only a small fraction.
+- **GitHub Actions:** a normal run takes a minute or two, and the five skipped firings each take a few seconds. A run where Gemini is down can take about 12 minutes because of the 10-minute LLM cap. Public repos get free minutes on standard runners; private repos draw from the account's monthly included minutes (2,000 on the Free plan), so a daily run uses only a small fraction.
 - **iCloud Mail:** included with your Apple account.
 
 
 ## Offline regression checks
 
-Run `.venv/bin/python -m unittest discover -s tests -v`. Tests cover delivery outcomes and backup receipts, duplicate evidence preservation, TLDR parsing and fallback, editorial validation, and short-selection retry behavior. SMTP and Gemini are mocked; tests do not send email or consume API quota. The TLDR parser was also checked against the public October 30, 2026 issue.
+Run `.venv/bin/python -m unittest discover -s tests -v`. Tests cover delivery outcomes, the send window (CST, CDT, DST switch days, receipts, early manual runs), duplicate evidence preservation, TLDR parsing and fallback, editorial validation, and short-selection retry behavior. SMTP and Gemini are mocked; tests do not send email or consume API quota. The TLDR parser was also checked against the public October 30, 2026 issue.
 
 Implementation prompts are in `prompts/prompt_12_track_email_delivery.md` through `prompts/prompt_15_validate_editorial_output.md`, executed sequentially with checks after each stage.
 

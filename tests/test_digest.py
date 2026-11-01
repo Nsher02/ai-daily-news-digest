@@ -1,8 +1,12 @@
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
+import yaml
+
 import digest
+import send_window
 
 
 class DeliveryTests(unittest.TestCase):
@@ -30,22 +34,72 @@ class DeliveryTests(unittest.TestCase):
                 self.assertEqual(outcomes[-1], 'outcome=' + expected)
                 self.assertEqual(send.call_count, 0 if dry else 1)
 
-    def test_backup_guard_requires_successful_receipt(self):
-        import os
-        import subprocess
-        import yaml
+def utc(stamp):
+    return datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc)
+
+
+def run(event, started, marker_date=None, run_id=1):
+    return {'id': run_id, 'event': event, 'started': started, 'markers': {f'SMTP accepted: {marker_date}'} if marker_date else set()}
+
+
+class SendWindowTests(unittest.TestCase):
+    def test_window_in_cst_and_cdt(self):
+        # (UTC firing, expected send): CDT is UTC-5, CST is UTC-6.
+        cases = [
+            ('2026-10-15T12:53', True),   # CDT 7:53
+            ('2026-10-15T11:53', False),  # CDT 6:53
+            ('2026-10-15T12:23', False),  # CDT 7:23, before 7:45
+            ('2026-10-15T14:53', True),   # CDT 9:53, late but inside window
+            ('2026-10-15T15:00', False),  # CDT 10:00
+            ('2026-12-15T13:53', True),   # CST 7:53
+            ('2026-12-15T12:53', False),  # CST 6:53
+            ('2026-12-15T14:23', True),   # CST 8:23
+            ('2026-03-08T12:53', True),   # spring-forward day, CDT 7:53
+            ('2026-03-08T13:53', True),   # spring-forward day, CDT 8:53
+            ('2026-11-01T12:53', False),  # fall-back day, CST 6:53
+            ('2026-11-01T13:53', True),   # fall-back day, CST 7:53
+            ('2026-03-07T12:53', False),  # day before spring-forward, CST 6:53
+        ]
+        for stamp, expected in cases:
+            with self.subTest(stamp=stamp):
+                self.assertEqual(send_window.decide(utc(stamp), [])[0], expected)
+
+    def test_every_morning_has_a_753_firing(self):
         workflow = yaml.load(Path('.github/workflows/daily-digest.yml').read_text(), Loader=yaml.BaseLoader)
-        script = workflow['jobs']['digest']['steps'][0]['run']
-        # gh's jq filtering is represented by the returned successful step names.
-        prelude = '''date() { echo 2026-10-31; }
-        gh() { case "$*" in *'/jobs?'*) printf '%s\\n' "$TEST_MARKERS";; *) echo 123;; esac; }
-        '''
-        for markers, skips in [('Build and send digest', False), ('SMTP accepted: 2026-10-30', False), ('SMTP accepted: 2026-10-31', True), ('', False)]:
-            with self.subTest(markers=markers), tempfile.TemporaryDirectory() as tmp:
-                output = Path(tmp) / 'output'
-                output.touch()
-                subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', prelude + script], check=True, capture_output=True, env={**os.environ, 'TEST_MARKERS': markers, 'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': str(output.with_name('summary')), 'GITHUB_REPOSITORY': 'owner/repo'})
-                self.assertEqual('skip=true' in output.read_text(), skips)
+        crons = [entry['cron'] for entry in workflow['on']['schedule']]
+        self.assertIn('53 12,13,14 * * *', crons)
+        self.assertNotIn('timezone', str(workflow['on']['schedule']))
+        for day in ['2026-01-15', '2026-03-08', '2026-07-15', '2026-11-01']:
+            local = [utc(f'{day}T{h}:53').astimezone(send_window.TZ).strftime('%H:%M') for h in (12, 13, 14)]
+            self.assertIn('07:53', local)
+
+    def test_second_run_skips_after_send(self):
+        sent = run('schedule', '2026-12-15T13:53:10Z', '2026-12-15')
+        self.assertEqual(send_window.decide(utc('2026-12-15T14:23'), [sent]), (False, "today's digest was already sent by run 1 (schedule)"))
+        manual = run('workflow_dispatch', '2026-12-15T14:00:00Z', '2026-12-15')  # 8:00 CST
+        self.assertFalse(send_window.decide(utc('2026-12-15T14:23'), [manual])[0])
+
+    def test_unsent_or_old_runs_do_not_block(self):
+        runs = [run('schedule', '2026-12-15T13:53:10Z'), run('workflow_dispatch', '2026-12-14T20:00:00Z', '2026-12-14')]
+        self.assertTrue(send_window.decide(utc('2026-12-15T14:23'), runs)[0])
+
+    def test_early_manual_run_does_not_block(self):
+        early = run('workflow_dispatch', '2026-12-15T12:30:00Z', '2026-12-15')  # 6:30 CST
+        self.assertTrue(send_window.decide(utc('2026-12-15T13:53'), [early])[0])
+        early_cdt = run('workflow_dispatch', '2026-10-15T12:44:00Z', '2026-10-15')  # 7:44 CDT
+        self.assertTrue(send_window.decide(utc('2026-10-15T12:53'), [early_cdt])[0])
+
+    def test_reads_receipts_from_successful_steps(self):
+        pages = {
+            'runs': [{'workflow_runs': [
+                {'id': 7, 'event': 'schedule', 'run_started_at': '2026-12-15T13:53:00Z', 'created_at': '2026-12-15T13:53:00Z'},
+                {'id': 8, 'event': 'schedule', 'run_started_at': '2026-12-15T14:23:00Z', 'created_at': '2026-12-15T14:23:00Z'}]}],
+            7: [{'jobs': [{'steps': [{'name': 'SMTP accepted: 2026-12-15', 'conclusion': 'success'}, {'name': 'Build and send digest', 'conclusion': 'success'}]}]}],
+        }
+        fake = lambda path: pages['runs'] if '/workflows/' in path else pages[int(path.split('/runs/')[1].split('/')[0])]
+        with patch.object(send_window, 'gh_json', side_effect=fake):
+            runs = send_window.recent_runs('owner/repo', utc('2026-12-15T14:23'), '8')
+        self.assertEqual(runs, [{'id': 7, 'event': 'schedule', 'started': '2026-12-15T13:53:00Z', 'markers': {'SMTP accepted: 2026-12-15'}}])
 
 
 def news(title, url, source='Publisher', summary=''):
@@ -193,29 +247,27 @@ class IntegrationTests(unittest.TestCase):
 
     def test_guard_filters_failed_markers_and_fails_on_api_errors(self):
         import json
-        import os
         import subprocess
-        import yaml
-        workflow = yaml.load(Path('.github/workflows/daily-digest.yml').read_text(), Loader=yaml.BaseLoader)
-        script = workflow['jobs']['digest']['steps'][0]['run']
-        prelude = '''date() { echo 2026-10-31; }
-        gh() {
-          if [ "$API_FAIL" = 1 ]; then return 1; fi
-          case "$*" in
-            *'/jobs?'*) printf '%s' "$TEST_JOBS" | jq -r "${@: -1}";;
-            *) echo 123;;
-          esac
-        }
-        '''
-        for conclusion, api_fail, skip in [('success', '0', True), ('failure', '0', False), ('skipped', '0', False), ('success', '1', False)]:
+        now = utc('2026-10-31T13:23')  # 8:23 CDT
+        runs = {'workflow_runs': [{'id': 5, 'event': 'schedule', 'run_started_at': '2026-10-31T12:53:00Z', 'created_at': '2026-10-31T12:53:00Z'}]}
+        for conclusion, api_fail, skip in [('success', False, True), ('failure', False, False), ('skipped', False, False), ('success', True, None)]:
+            jobs = {'jobs': [{'steps': [{'name': 'SMTP accepted: 2026-10-31', 'conclusion': conclusion}]}]}
+            def gh(cmd, **kwargs):
+                if api_fail:
+                    raise subprocess.CalledProcessError(1, cmd)
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([jobs if '/jobs?' in cmd[-1] else runs]))
             with self.subTest(conclusion=conclusion, api_fail=api_fail), tempfile.TemporaryDirectory() as tmp:
                 output = Path(tmp) / 'output'
                 output.touch()
-                jobs = {'jobs': [{'steps': [{'name': 'SMTP accepted: 2026-10-31', 'conclusion': conclusion}]}]}
-                proc = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', prelude + script], capture_output=True, env={**os.environ, 'TEST_JOBS': json.dumps(jobs), 'API_FAIL': api_fail, 'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': str(output.with_name('summary')), 'GITHUB_REPOSITORY': 'owner/repo'})
-                self.assertEqual(proc.returncode == 0, api_fail == '0')
-                self.assertEqual('skip=true' in output.read_text(), skip)
-
+                env = {'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': str(output.with_name('summary')), 'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_RUN_ID': '9'}
+                with patch.dict('os.environ', env), patch.object(send_window.subprocess, 'run', side_effect=gh), patch.object(send_window, 'datetime', wraps=datetime) as clock, patch('builtins.print'):
+                    clock.now.return_value = now
+                    if api_fail:
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            send_window.main()
+                    else:
+                        send_window.main()
+                self.assertEqual('skip=true' in output.read_text(), bool(skip))
 
 class GroundingTests(unittest.TestCase):
     def test_generated_headline_is_not_evidence(self):
