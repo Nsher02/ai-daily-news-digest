@@ -1,8 +1,9 @@
 """Decide whether a scheduled run should send today's digest.
 
-GitHub's cron runs in UTC and can start late, so the workflow fires several times
-each morning and this check lets through only the first run inside the local send
-window. Manual runs never call this.
+Scheduled runs come from cron-job.org (workflow_dispatch with trigger=external-schedule)
+and from GitHub's own cron as a backup, which runs in UTC and can start late or not at
+all. This check lets through only the first scheduled run inside the local send window.
+Plain manual runs always send.
 """
 
 import json
@@ -22,8 +23,15 @@ def parse_time(stamp):
     return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
 
 
+def is_scheduled(event, trigger):
+    return event == "schedule" or (event == "workflow_dispatch" and trigger == "external-schedule")
+
+
 def counts_as_sent(run, today):
-    """A run blocks the morning send if it emailed today's digest, unless it was a manual run before the window."""
+    """A run blocks the morning send if it emailed today's digest, unless it was a manual run before the window.
+
+    External-schedule runs are also workflow_dispatch, but they can only send inside the window.
+    """
     if MARKER + today.isoformat() not in run["markers"]:
         return False
     started = parse_time(run["started"]).astimezone(TZ)
@@ -62,8 +70,11 @@ def recent_runs(repo, now, current_id):
 
 
 def main():
-    now = datetime.now(timezone.utc)
-    send, reason = decide(now, recent_runs(os.environ["GITHUB_REPOSITORY"], now, os.environ.get("GITHUB_RUN_ID", "")))
+    if not is_scheduled(os.environ.get("EVENT_NAME", ""), os.environ.get("TRIGGER") or "manual"):
+        send, reason = True, "manual run, always sends"
+    else:
+        now = datetime.now(timezone.utc)
+        send, reason = decide(now, recent_runs(os.environ["GITHUB_REPOSITORY"], now, os.environ.get("GITHUB_RUN_ID", "")))
     print(("Sending: " if send else "Skipping: ") + reason)
     with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
         handle.write(f"skip={'false' if send else 'true'}\n")
