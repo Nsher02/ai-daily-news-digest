@@ -30,15 +30,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           today=$(TZ=America/Chicago date +%F)
-          for ts in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow daily-digest.yml \
-                        --status success --limit 20 --json updatedAt --jq '.[].updatedAt'); do
-            if [ "$(TZ=America/Chicago date -d "$ts" +%F)" = "$today" ]; then
-              echo "A successful run already finished today ($ts); skipping."
+          since=$(TZ=America/Chicago date -d 'yesterday' +%F)
+          runs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/daily-digest.yml/runs?created=%3E%3D$since&per_page=100" --jq '.workflow_runs[].id')
+          for run_id in $runs; do
+            markers=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=all&per_page=100" \
+              --jq '.jobs[].steps[]? | select(.conclusion == "success") | .name')
+            if printf '%s\n' "$markers" | grep -Fxq "SMTP accepted: $today"; then
+              echo "Today's digest was accepted by SMTP; skipping."
               echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "Digest skipped: SMTP already accepted today's digest." >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
           done
-          echo "No successful run yet today ($today); continuing."
+          echo "No SMTP-accepted marker today ($today); continuing."
 
       - uses: actions/checkout@v7
         if: steps.guard.outputs.skip != 'true'
@@ -54,6 +58,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Build and send digest
+        id: build
         if: steps.guard.outputs.skip != 'true'
         run: python digest.py
         env:
@@ -64,3 +69,8 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+
+      # A successful named step is the durable receipt read by the next scheduled run.
+      - name: "SMTP accepted: ${{ steps.build.outputs.digest_date }}"
+        if: steps.build.outputs.outcome == 'sent'
+        run: echo "SMTP accepted the digest. This does not prove inbox delivery."
