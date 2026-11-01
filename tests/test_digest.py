@@ -89,6 +89,33 @@ class SendWindowTests(unittest.TestCase):
         early_cdt = run('workflow_dispatch', '2026-10-15T12:44:00Z', '2026-10-15')  # 7:44 CDT
         self.assertTrue(send_window.decide(utc('2026-10-15T12:53'), [early_cdt])[0])
 
+    def test_external_trigger_then_github_cron(self):
+        self.assertTrue(send_window.is_scheduled('workflow_dispatch', 'external-schedule'))
+        self.assertTrue(send_window.is_scheduled('schedule', ''))
+        # cron-job.org fires at 7:50 CST and sends; GitHub's 7:53 backup then skips.
+        self.assertTrue(send_window.decide(utc('2026-12-15T13:50'), [])[0])
+        external = run('workflow_dispatch', '2026-12-15T13:50:05Z', '2026-12-15')
+        self.assertEqual(send_window.decide(utc('2026-12-15T13:53'), [external]), (False, "today's digest was already sent by run 1 (workflow_dispatch)"))
+        # Same in CDT.
+        external_cdt = run('workflow_dispatch', '2026-07-15T12:50:05Z', '2026-07-15')
+        self.assertFalse(send_window.decide(utc('2026-07-15T12:53'), [external_cdt])[0])
+
+    def test_external_trigger_outside_window_skips(self):
+        for stamp in ['2026-12-15T13:00', '2026-12-15T20:36', '2026-07-15T16:00']:  # 7:00 CST, 2:36 PM CST, 11:00 CDT
+            with self.subTest(stamp=stamp):
+                self.assertFalse(send_window.decide(utc(stamp), [])[0])
+
+    def test_manual_run_always_sends(self):
+        self.assertFalse(send_window.is_scheduled('workflow_dispatch', 'manual'))
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'output'
+            output.touch()
+            # No GitHub API access and outside the window: a manual run must still send.
+            with patch.dict('os.environ', {'GITHUB_OUTPUT': str(output), 'EVENT_NAME': 'workflow_dispatch', 'TRIGGER': 'manual'}), patch.object(send_window, 'recent_runs') as runs, patch('builtins.print'):
+                send_window.main()
+            self.assertIn('skip=false', output.read_text())
+            runs.assert_not_called()
+
     def test_reads_receipts_from_successful_steps(self):
         pages = {
             'runs': [{'workflow_runs': [
@@ -259,7 +286,7 @@ class IntegrationTests(unittest.TestCase):
             with self.subTest(conclusion=conclusion, api_fail=api_fail), tempfile.TemporaryDirectory() as tmp:
                 output = Path(tmp) / 'output'
                 output.touch()
-                env = {'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': str(output.with_name('summary')), 'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_RUN_ID': '9'}
+                env = {'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': str(output.with_name('summary')), 'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_RUN_ID': '9', 'EVENT_NAME': 'schedule'}
                 with patch.dict('os.environ', env), patch.object(send_window.subprocess, 'run', side_effect=gh), patch.object(send_window, 'datetime', wraps=datetime) as clock, patch('builtins.print'):
                     clock.now.return_value = now
                     if api_fail:

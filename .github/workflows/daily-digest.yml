@@ -1,43 +1,45 @@
 name: "AI Daily News Digest"
+run-name: "AI Daily News Digest (${{ github.event_name == 'schedule' && 'github-cron' || inputs.trigger }})"
 
 on:
+  # Main schedule: cron-job.org dispatches with trigger=external-schedule at 7:50 AM Chicago.
+  workflow_dispatch:
+    inputs:
+      trigger:
+        description: "manual always sends; external-schedule obeys the send window"
+        type: choice
+        options: [manual, external-schedule]
+        default: manual
+  # Backup: GitHub's cron is unreliable. Plain UTC (no `timezone:`); 12-14 UTC covers
+  # 7:53 AM Chicago in both CST (UTC-6) and CDT (UTC-5). The window check drops extras.
   schedule:
-    # Plain UTC crons (no `timezone:`). 12-14 UTC covers 7:53 AM Chicago in both CST
-    # (UTC-6) and CDT (UTC-5); the "Check send window" step drops the extra firings.
     - cron: "53 12,13,14 * * *"
     - cron: "23 12,13,14 * * *"
-    - cron: "2 20 * * *" # TEMPORARY: proves the scheduler fires; remove after one run
-  workflow_dispatch:
 
 permissions:
   actions: read
   contents: read
 
-# A delayed run waits for the previous one, then its window check sees the receipt and skips.
+# A run that starts while another is going waits for it, then its window check sees the receipt and skips.
 concurrency:
   group: daily-digest
   cancel-in-progress: false
 
 jobs:
-  scheduler-test:
-    if: github.event.schedule == '2 20 * * *'
-    runs-on: ubuntu-latest
-    steps:
-      - run: 'echo "TEST: scheduler fired"'
-
   digest:
-    if: github.event.schedule != '2 20 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
-      # Scheduled runs send once, the first time one lands between 7:45 and 10:00 AM Chicago.
+      # Scheduled runs (external or GitHub cron) send once, the first time one lands
+      # between 7:45 and 10:00 AM Chicago. Plain manual runs always send.
       - name: Check send window
         id: guard
-        if: github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          TRIGGER: ${{ inputs.trigger }}
         run: python3 send_window.py
 
       - uses: actions/setup-python@v7
