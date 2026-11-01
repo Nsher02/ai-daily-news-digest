@@ -10,9 +10,9 @@ Everything lives in `digest.py`; `main()` runs these steps in order.
 
 | # | Step | Function | What happens |
 | --- | --- | --- | --- |
-| 1 | Fetch | `fetch_all` / `fetch_feed` | Downloads each feed in `config.yaml` with `requests` (timeout `request_timeout`, browser-like `user_agent`) and parses it with `feedparser`. Google News titles lose their ` - Publisher` suffix and the publisher becomes the source; TLDR AI's empty issue items are filled in from the issue page (`fetch_issue_stories`). |
+| 1 | Fetch | `fetch_all` / `fetch_feed` | Downloads each feed in `config.yaml` with `requests` (timeout `request_timeout`, browser-like `user_agent`) and parses it with `feedparser`. Google News titles lose their ` - Publisher` suffix and the publisher becomes the source; TLDR AI issues are expanded into individual article items (`fetch_issue_stories`), each with its own headline, snippet and destination link. |
 | 2 | Filter | `fetch_feed` | Keeps items published in the last `lookback_hours`. Items with no date are dropped (logged as a warning). Each feed is sorted newest first and capped at its `max_items`. |
-| 3 | Dedupe | `dedupe` | Drops an item if its **normalized URL** or **normalized title** was already seen. The first occurrence wins, in feed order. |
+| 3 | Dedupe | `dedupe` | Groups items matching a **normalized URL** or **normalized title** into one candidate, retaining every source link and the best snippet per publisher. |
 | 4 | Pass 1: pick | `summarize` / `run_llm_chain` | Sends all items to Gemini in one request. The model picks `min_stories`–`max_stories` stories (10–15), merges duplicates, ranks multi-source stories higher, sorts them into sections, and returns JSON with short summaries. |
 | 5 | Read articles | `enrich_story` | For each picked story, in parallel (10 workers): resolves Google News redirect links to the publisher's URL (`decode_google_news`), fetches the article page (`article_timeout`, 10s) and extracts the main text with **trafilatura**, trimmed to `article_chars` (4,000). Also picks the story's image (see [Email design](#email-design)). |
 | 6 | Pass 2: write | `build_summary_prompt` / `run_llm_chain` | **One** batched Gemini request writes a 4–6 sentence paragraph per story (what happened, key details and numbers, why it matters) using only the fetched article text and feed snippets. Stories whose article couldn't be fetched get 1–3 sentences from the snippets only. |
@@ -23,21 +23,23 @@ Everything lives in `digest.py`; `main()` runs these steps in order.
 - URL: lowercase scheme and host, strip `www.`, drop `utm_*` query params, the `#fragment` and a trailing `/`. Other query params are kept (so `?id=1` and `?id=2` stay distinct).
 - Title: lowercase, curly quotes → straight, punctuation removed, whitespace collapsed.
 
-This only catches *exact* duplicates. The same story covered by two outlets with different headlines gets through dedupe, and the LLM merges it in pass 1. The prompt treats a story covered by several sources as a strong signal of importance: it ranks higher and lists every source. It also prioritizes major model releases, big company and lab news, funding and policy over minor product updates.
+Grouping includes transitive URL/title matches and preserves original evidence. Distinct publishers are counted once even when also found through Google News. This only catches *exact* duplicates. The same story covered by two outlets with different headlines gets through dedupe, and the LLM merges it in pass 1. The prompt treats a story covered by several sources as a strong signal of importance: it ranks higher and lists every source. It also prioritizes major model releases, big company and lab news, funding and policy over minor product updates.
 
 ### The ID-mapping design (why links can't be invented)
 
 Each item goes into the prompt as `[id] (source) title` plus a snippet. The model is told to return only item **IDs**, never URLs:
 
 ```json
-{"tldr": "...", "sections": [{"name": "...", "stories": [{"ids": [3, 17], "headline": "...", "summary": "..."}]}]}
+{"tldr": "...", "excluded_ids": [], "sections": [{"name": "...", "stories": [{"ids": [3, 17], "headline": "...", "summary": "..."}]}]}
 ```
 
-The code then maps each ID back to the real feed item and attaches *that item's* link and source name. Any ID that isn't an integer in range is logged and ignored; a story left with no valid IDs is dropped. A merged story gets one link per source. Its headline links to the article that pass 2 actually read (falling back to the first direct link), and the email shows that publisher above the headline and the others as "Also covered by …".
+The code maps each group ID back to its original feed evidence and source links. IDs must be integers in range (booleans are rejected). Repeated IDs within a story are collapsed; stories reusing an already selected ID or normalized headline are skipped. Headlines and summaries must be nonempty strings. Unknown sections are discarded, duplicate section blocks are combined, sections follow the configured editorial order, and the selected digest is capped at `max_stories`. A response with no usable stories fails validation. The raw-headlines emergency fallback retains its existing all-items behavior.
+
+A merged story keeps original source links. Its headline links to the article that pass 2 actually read (falling back to the first direct link), with other publishers shown as "Also covered by …". Publisher names are compared without case, whitespace or punctuation differences; different aliases for the same publisher are not automatically resolved.
 
 ### The "(title only)" anti-hallucination rule
 
-Some feeds carry no real description. Hacker News (hnrss) fills the summary with boilerplate like `Article URL: … Comments URL: … Points: 132 # Comments: 72`. `clean_text` strips HTML tags and that boilerplate (`FEED_BOILERPLATE`) and truncates to 300 characters (or the feed's `snippet_chars`; TLDR AI uses 1500 because one item holds a whole newsletter issue). Google News summaries only repeat the title, so they're dropped. If nothing is left, the item is sent to the model marked **`(title only)`**.
+Some feeds carry no real description. Hacker News (hnrss) fills the summary with boilerplate like `Article URL: … Comments URL: … Points: 132 # Comments: 72`. `clean_text` strips HTML tags and that boilerplate (`FEED_BOILERPLATE`) and truncates to 300 characters (or the feed's `snippet_chars`; TLDR AI allows up to 1500 characters per extracted story). Google News summaries only repeat the title, so they're dropped. If nothing is left, the item is sent to the model marked **`(title only)`**.
 
 The prompt tells the model to summarize those items using only what the headline says ("HN discussion of …"), and never to add details, causes, numbers or quotes that aren't in the title or snippet. Temperature is `0.2` to keep output conservative.
 
@@ -49,7 +51,7 @@ After pass 1, `enrich_story` prepares each story:
 - **Which article is read:** the first direct link (not Google News, not a TLDR issue page); if it fails or has under 300 characters of text, the next one. At most two tries per story.
 - **Paywalls and errors:** the story is marked "article unavailable" and pass 2 writes a shorter summary from the headline and feed snippets only.
 
-Pass 2 sends all stories in **one** request, each with its headline, sources, feed snippets and article text. The prompt says to use only facts from that text, never names, numbers, dates, quotes or background from the model's own knowledge, and to leave out "why it matters" rather than guess. The model returns `{"stories": [{"n": 1, "summary": "..."}]}`; a story missing from the reply keeps its pass-1 summary.
+Pass 2 sends all stories in **one** request containing original feed titles, snippets and article text. Generated pass-1 headlines are omitted from the evidence. Both prompts tell the model to treat source content as data and ignore embedded instructions. The prompt says to use only facts from that text, never names, numbers, dates, quotes or background from the model's own knowledge, and to leave out "why it matters" rather than guess. The model returns final headlines and summaries plus a final TL;DR. Missing or invalid rewrites keep their pass-1 fields. The final TL;DR replaces the first one only when every story has a valid rewrite. Prompt instructions reduce risk but do not prove factual accuracy.
 
 **Gemini usage:** a normal run makes **2 requests** (pass 1 + pass 2). Pass 2 uses the same retry chain minus the 5-minute final wait, because a pass-1 digest is already a good fallback.
 
@@ -71,9 +73,9 @@ Pass 2 sends all stories in **one** request, each with its headline, sources, fe
 4. Pass 1 only: wait **5 minutes** (`llm_final_wait`), then the primary one last time.
 5. Only then: the raw-headlines fallback email (pass 1) or the short pass-1 summaries (pass 2).
 
-If the model returns fewer than `min_stories` stories, that counts as a failed attempt, but the short digest is kept and used if nothing better comes back. Every failed attempt logs the exact cause, for example `ERROR LLM pass 1 attempt 1 (gemini-3.5-flash) failed after 4s: HTTP 503 InternalServerError: [{"error": {"code": 503, "message": "This model is currently experiencing high demand. …"}}]`.
+The requested minimum is clamped to the available duplicate groups. A shorter selection is accepted immediately when its selected/merged IDs and `excluded_ids` are disjoint and account for every input group. Otherwise the existing retry chain tries for a fuller selection and keeps the short digest as a fallback. Semantic eligibility and merging remain model judgments; Python validates the accounting, not whether every exclusion was editorially justified. Every failed attempt logs the exact cause, for example `ERROR LLM pass 1 attempt 1 (gemini-3.5-flash) failed after 4s: HTTP 503 InternalServerError: [{"error": {"code": 503, "message": "This model is currently experiencing high demand. …"}}]`.
 
-**Hard cap:** the whole LLM step (pass 1, article fetching and pass 2) finishes within **10 minutes** (`llm_step_cap: 600`) no matter what. If the cap hits after pass 1 succeeded, the email uses the pass-1 digest instead of raw headlines. The chain shortens the 5-minute wait if needed so the last attempt fits, and a watchdog thread gives up on the step at the cap even if a request hangs and ignores its timeout. Worst case: about 4.5 min of primary attempts, 1 min of Flash-Lite, a wait shortened to about 3.5 min, then 1 min for the final try.
+**Hard cap:** the whole LLM step (pass 1, article fetching and pass 2) has a **10-minute** budget (`llm_step_cap: 600`). If the cap hits after pass 1 succeeded, the email uses the pass-1 digest instead of raw headlines. The chain shortens the 5-minute wait if needed so the last attempt fits, and a parent supervisor kills the worker subprocess (including its fetch threads) when the deadline is reached. Atomic checkpoints preserve completed pass-1/enrichment results. A small cleanup reserve is deducted from the configured cap. Enrichment requests use the remaining deadline; up to one request timeout (or half the remaining budget) is reserved for pass 2. At most three image candidates are checked, and optional image work stops near the enrichment cutoff. OS scheduling and process cleanup can add a small amount of overhead; a hung request cannot keep background workers alive indefinitely. Worst case: about 4.5 min of primary attempts, 1 min of Flash-Lite, a wait shortened to about 3.5 min, then 1 min for the final try.
 
 ### Email design
 
@@ -123,7 +125,9 @@ on:
 
 Both times are deliberately **off the top of the hour**. GitHub is busiest at :00 and drops or delays scheduled runs then (the old `0 8 * * *` schedule once never fired at all).
 
-**Skip guard:** the first step of a *scheduled* run uses the preinstalled `gh` CLI (`GH_TOKEN: ${{ github.token }}`, with `permissions: actions: read` and `contents: read`) to check whether a successful run of this workflow already finished **today**, by America/Chicago date. If one did, every later step is skipped, so the backup only sends when the primary failed or never fired. Manual `workflow_dispatch` runs never run the guard and always send. A `concurrency` group makes a backup that starts while a delayed primary is still running wait for it, then skip.
+**Skip guard:** scheduled runs inspect recent workflow job steps for a successful `SMTP accepted: YYYY-MM-DD` receipt matching today's America/Chicago date. Only `send_email` returning successfully produces that receipt. Generic successful runs, empty feeds, skipped runs, dry runs and failed sends do not suppress the backup. Run/job listings are paginated; API failures fail the guard rather than silently risking a duplicate. Manual runs always send, and concurrency serializes primary and backup runs. The script exposes `sent`, `no_items`, `failed`, or `dry_run` through Actions outputs.
+
+SMTP acceptance does not prove inbox delivery. A runner crash between SMTP acceptance and recording the receipt can still cause a duplicate on retry; SMTP offers no atomic transaction with GitHub's run metadata. Existing runs from before this change have no receipt.
 
 The `timezone` field takes an IANA name and GitHub handles daylight saving, so the times stay local all year. Without `timezone`, cron times are UTC.
 
@@ -171,7 +175,7 @@ The job runs on `ubuntu-latest` with Python 3.13, caches pip, and has a **20-min
 | `email.subject_prefix` | `AI Daily News Digest` | Subject is `<prefix> — <Weekday, Month Day>`. Also the big heading at the top of the email. |
 | `email.from_name` | `AI News` | Display name on the From line. |
 | `email.to_name` | `Noah Sher` | Display name on the To line. |
-| `feeds[]` | 13 feeds | Each has `name` (shown in the email), `url` and `max_items` (cap per run). Optional: `snippet_chars` (snippet length sent to the LLM, default 300), `strip_publisher: true` (Google News: strip ` - Publisher` from titles and show the publisher as the source), `expand_issue: true` (TLDR: read the issue's stories from its web page). |
+| `feeds[]` | 13 feeds | Each has `name` (shown in the email), `url` and `max_items` (cap per run). Optional: `snippet_chars` (snippet length sent to the LLM, default 300), `strip_publisher: true` (Google News: strip ` - Publisher` from titles and show the publisher as the source), `expand_issue: true` (TLDR: create separate story items from its web page). |
 
 Headers are built with `email.utils.formataddr`, so names containing `&` or non-ASCII characters are encoded correctly.
 
@@ -188,7 +192,7 @@ Headers are built with `email.utils.formataddr`, so names containing `&` or non-
 | OpenAI News | 10 | Only has items on days OpenAI posts. |
 | Google DeepMind | 10 | Only has items on days DeepMind posts. |
 | Hugging Face Blog | 10 | |
-| TLDR AI | 5 | One empty item per newsletter issue (weekdays only); stories are pulled from the issue page and sent with a 1500-char snippet. |
+| TLDR AI | 5 | Issues are expanded into separate stories with up to 1500 characters each. The five-item cap applies to stories; timestamps come from the issue. Extraction failures log a warning and retain the issue as a fallback. |
 | Google News – AI | 20 | Search: "artificial intelligence" OR "generative AI" OR LLM. Publisher shown as the source. |
 | Google News – Labs | 15 | Search: Anthropic OR "Meta AI" OR xAI OR Mistral. Publisher shown as the source. |
 | Hacker News (100+ points) | 15 | Front-page stories with 100+ points. |
@@ -205,7 +209,7 @@ Add an entry under `feeds:` (any RSS or Atom feed works):
     max_items: 10
 ```
 
-To remove one, delete its three lines. Feed order matters slightly: when dedupe finds duplicates, the feed listed first keeps its copy. Test a new feed with a dry run (see [Running locally](#running-locally-optional)); a bad URL shows up as `ERROR <name>: failed, skipping`.
+To remove one, delete its three lines. Feed order selects the representative headline for exact duplicate groups; every original source link and the best snippet per publisher remain available. Test a new feed with a dry run (see [Running locally](#running-locally-optional)); a bad URL shows up as `ERROR <name>: failed, skipping`.
 
 ### Change the number of stories or the lookback window
 
@@ -354,7 +358,7 @@ Open **Actions** → the failed run → the **digest** job → expand **Build an
 | `429 … Generate content requests per day limit exceeded` | The free tier's 20 requests/day for that model is used up (usually from many manual test runs). The chain skips straight to Flash-Lite. | Wait for the daily reset; avoid many test runs in one day. |
 | `paragraph summaries failed, using short summaries` | Pass 2 failed on every attempt. The email still has the pass-1 short summaries. | Transient; no action unless it repeats. |
 | `article fetch failed for <url>` / `could not resolve Google News link` | A paywall, block or timeout on one article. That story gets a shorter snippet-based summary. | None; normal for a few stories a day. |
-| `A successful run already finished today …; skipping.` | Normal for the backup run when the primary already sent. | None. |
+| `Today's digest was accepted by SMTP; skipping.` | Normal for the backup run when the primary already sent. | None. |
 | `ERROR <feed>: failed, skipping (…)` | One feed is down, moved, or blocking the request. The run continues and stays green. | If it repeats for days, fix or remove the URL in `config.yaml`. |
 | `Error: The operation was canceled` after 20 minutes | Hit `timeout-minutes: 20`. Shouldn't happen, since the LLM step is capped at 10 minutes. | Rerun, and check which step was slow. |
 
@@ -385,3 +389,33 @@ The repo is currently private. In a **public** repository, GitHub automatically 
 - **Gemini:** 2 requests per day on a normal run (pass 1 + pass 2; at most 11 on a very bad day). The free tier allows **20 requests per day per model**, so a manual test run or two is fine, but many test runs in one day will hit `429 … PerDay` and fall back to Flash-Lite until the quota resets. Free-tier limits and model availability change over time; check AI Studio if you start seeing 429s.
 - **GitHub Actions:** a normal run takes a minute or two, and the backup run usually skips in a few seconds. A run where Gemini is down can take about 12 minutes because of the 10-minute LLM cap. Public repos get free minutes on standard runners; private repos draw from the account's monthly included minutes (2,000 on the Free plan), so a daily run uses only a small fraction.
 - **iCloud Mail:** included with your Apple account.
+
+
+## Offline regression checks
+
+Run `.venv/bin/python -m unittest discover -s tests -v`. Tests cover delivery outcomes and backup receipts, duplicate evidence preservation, TLDR parsing and fallback, editorial validation, and short-selection retry behavior. SMTP and Gemini are mocked; tests do not send email or consume API quota. The TLDR parser was also checked against the public October 30, 2026 issue.
+
+Implementation prompts are in `prompts/prompt_12_track_email_delivery.md` through `prompts/prompt_15_validate_editorial_output.md`, executed sequentially with checks after each stage.
+
+
+## Run summaries and offline replay
+
+Each executed digest writes a GitHub Actions step summary with successful/configured feeds, grouped candidates, selected stories, retrieved articles, LLM attempts, summary quality (`full`, `partial_pass_2`, `pass_1`, `raw_headlines`, or `none`), deadline status, and send outcome. A feed returning zero recent items still counts as a successful fetch. Attempt counts are saved before each model call, so a killed worker's in-flight attempt is included. Article counts include completed fetch results even if another worker hangs. Skipped backup runs report the existing receipt. A runner killed outside the supervised LLM stage may prevent the final summary from being written.
+
+To save a snapshot during a live dry run (fetches feeds and calls Gemini, but does not send email):
+
+```sh
+.venv/bin/python digest.py --dry-run --save-replay /private/tmp/digest-replay.json --output /private/tmp/digest-preview.html
+```
+
+To reparse successful saved model replies and render fully offline:
+
+```sh
+.venv/bin/python digest.py --replay /private/tmp/digest-replay.json --output /private/tmp/digest-replayed.html
+```
+
+Replay returns before loading `.env`, fetching feeds, constructing the API client, or sending email. It never writes a sent receipt. It preserves the original digest date. Raw-headline snapshots render without model replies. If parser changes reorder or remove selected stories, replay rejects saved pass-2 numbering rather than attaching a summary to the wrong story.
+
+Snapshots contain source text, article excerpts, selected stories and successful model replies; they explicitly omit credentials and environment variables. Save personal snapshots outside the repository. For an immediate synthetic offline example, use `tests/fixtures/replay.json` as the replay input. These snapshots support parser/rendering development; they do not measure how a live model responds to edited prompts.
+
+Prompts 16–18 implement grounding, subprocess deadlines, and summaries/replay sequentially. Regression tests include malformed JSON, partial rewrites, article failures, deadline exhaustion, real sleeping subprocess termination, saved checkpoints, replay isolation, and delivery outcomes. No additional runtime dependencies were introduced.
