@@ -2,50 +2,43 @@ name: "AI Daily News Digest"
 
 on:
   schedule:
-    # Off the top of the hour, when GitHub drops or delays scheduled runs.
-    - cron: "53 7 * * *" # primary: 7:53 AM Central, DST handled by GitHub
-      timezone: "America/Chicago"
-    - cron: "23 8 * * *" # backup: 8:23 AM Central, skipped if the primary already succeeded
-      timezone: "America/Chicago"
+    # Plain UTC crons (no `timezone:`). 12-14 UTC covers 7:53 AM Chicago in both CST
+    # (UTC-6) and CDT (UTC-5); the "Check send window" step drops the extra firings.
+    - cron: "53 12,13,14 * * *"
+    - cron: "23 12,13,14 * * *"
+    - cron: "42 18 * * *" # TEMPORARY: proves the scheduler fires; remove after one run
   workflow_dispatch:
 
 permissions:
   actions: read
   contents: read
 
-# If the primary run is delayed into the backup slot, the backup waits and then skips.
+# A delayed run waits for the previous one, then its window check sees the receipt and skips.
 concurrency:
   group: daily-digest
   cancel-in-progress: false
 
 jobs:
+  scheduler-test:
+    if: github.event.schedule == '42 18 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "TEST: scheduler fired"'
+
   digest:
+    if: github.event.schedule != '42 18 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Skip if today's digest already went out
+      - uses: actions/checkout@v7
+
+      # Scheduled runs send once, the first time one lands between 7:45 and 10:00 AM Chicago.
+      - name: Check send window
         id: guard
         if: github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          today=$(TZ=America/Chicago date +%F)
-          since=$(TZ=America/Chicago date -d 'yesterday' +%F)
-          runs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/daily-digest.yml/runs?created=%3E%3D$since&per_page=100" --jq '.workflow_runs[].id')
-          for run_id in $runs; do
-            markers=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=all&per_page=100" \
-              --jq '.jobs[].steps[]? | select(.conclusion == "success") | .name')
-            if printf '%s\n' "$markers" | grep -Fxq "SMTP accepted: $today"; then
-              echo "Today's digest was accepted by SMTP; skipping."
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              echo "Digest skipped: SMTP already accepted today's digest." >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-          done
-          echo "No SMTP-accepted marker today ($today); continuing."
-
-      - uses: actions/checkout@v7
-        if: steps.guard.outputs.skip != 'true'
+        run: python3 send_window.py
 
       - uses: actions/setup-python@v7
         if: steps.guard.outputs.skip != 'true'
@@ -70,7 +63,32 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
 
-      # A successful named step is the durable receipt read by the next scheduled run.
+      # A successful named step is the durable receipt read by later runs' window check.
       - name: "SMTP accepted: ${{ steps.build.outputs.digest_date }}"
         if: steps.build.outputs.outcome == 'sent'
         run: echo "SMTP accepted the digest. This does not prove inbox delivery."
+
+      - name: Email failure alert
+        if: failure()
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'EOF'
+          import os, smtplib, ssl
+          from email.message import EmailMessage
+          msg = EmailMessage()
+          msg["Subject"] = "AI Daily News Digest failed – check GitHub Actions"
+          msg["From"] = os.environ.get("EMAIL_FROM") or os.environ["SMTP_USER"]
+          msg["To"] = os.environ["EMAIL_TO"]
+          msg.set_content(f"Today's digest run failed. Logs: {os.environ['RUN_URL']}")
+          with smtplib.SMTP(os.environ["SMTP_HOST"], int(os.environ.get("SMTP_PORT") or 587), timeout=30) as smtp:
+              smtp.starttls(context=ssl.create_default_context())
+              smtp.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"])
+              smtp.send_message(msg)
+          EOF
