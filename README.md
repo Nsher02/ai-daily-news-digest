@@ -82,6 +82,7 @@ The requested minimum is clamped to the available duplicate groups. A shorter se
 The email follows `design/Apple_News_reference.jpeg`: a compact morning briefing with distinct black and gray tones. It retains **AI Daily News Digest** branding and includes no Apple logos or promotional modules.
 
 - **Palette:** charcoal outer canvas `#383838`, near-black reading column `#1c1c1c`, bright headlines `#f5f5f5`, soft gray summaries `#b0b0b0`, muted source names `#a0a0a0`, thin dividers `#484848`, strong rules `#999999`, and pink Top Stories lettering `#ff375f`.
+- **Header fade:** the reading column starts at `#2c2c2e`, passes through `#232324`, and fades into `#1c1c1c` over the first 160px, matching the reference. Inline solid backgrounds remain as fallbacks for clients that do not support gradients.
 - **Header:** small date, compact sans-serif “Good Morning” masthead and digest title, then a serif TL;DR.
 - **Top stories:** text-first bullets with bold serif headlines flowing into gray summaries. There is no large hero image.
 - **Other sections:** uppercase section titles, serif headlines with publisher credits below, square thumbnails on the right when available, and full-width gray summaries.
