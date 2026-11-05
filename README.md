@@ -86,6 +86,7 @@ The email follows `design/Apple_News_reference.jpeg`: a compact morning briefing
 - **Header:** small date, compact sans-serif “Good Morning” masthead and digest title, then a serif TL;DR.
 - **Top stories:** text-first bullets with bold serif headlines flowing into gray summaries. There is no large hero image.
 - **Other sections:** uppercase section titles, serif headlines with publisher credits below, square thumbnails on the right when available, and full-width gray summaries.
+- **Disclosure footer:** a full-width `#2c2c2c` gray band sits below the near-black story area, with muted `#b0b0b0` text, 24px top padding, and the same responsive side insets as the content. This replaces the previous inset rule and dark footer.
 - **Readability:** comfortable line heights intentionally avoid the overlapping text visible in the reference. Existing story content, source links, and plain-text email are preserved.
 
 **Email-safe HTML:** presentation tables, a 600px maximum reading column, inline critical colors, `bgcolor` fallbacks, and system fonts. The reference's dark palette is the default in both light and dark system appearances; this replaces the previous adaptive white background. A mobile media query reduces padding, masthead size, and thumbnails. Clients may override colors or fonts, block remote images, or ignore image cropping; browser previews do not guarantee identical rendering in every mail client.
