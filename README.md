@@ -83,7 +83,7 @@ The email follows `design/Apple_News_reference.jpeg`: a compact morning briefing
 
 - **Palette:** charcoal outer canvas `#383838`, near-black reading column `#1c1c1c`, bright headlines `#f5f5f5`, soft gray summaries `#b0b0b0`, muted source names `#a0a0a0`, thin dividers `#484848`, strong rules `#999999`, and pink Top Stories lettering `#ff375f`.
 - **Header fade:** the reading column starts at `#2c2c2e`, passes through `#232324`, and fades into `#1c1c1c` over the first 160px, matching the reference. Inline solid backgrounds remain as fallbacks for clients that do not support gradients.
-- **Header:** small date, compact sans-serif “Good Morning” masthead and digest title, then a serif TL;DR.
+- **Header:** small date, compact sans-serif “Good Morning From AI Daily News Digest” masthead, then a serif TL;DR.
 - **Top stories:** text-first bullets with bold serif headlines flowing into gray summaries. There is no large hero image.
 - **Other sections:** uppercase section titles, serif headlines with publisher credits below, square thumbnails on the right when available, and full-width gray summaries.
 - **Disclosure footer:** a full-width `#2c2c2c` gray band sits below the near-black story area, with muted `#b0b0b0` text, 24px top padding, and the same responsive side insets as the content. This replaces the previous inset rule and dark footer.
