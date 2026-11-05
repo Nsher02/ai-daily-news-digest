@@ -1,0 +1,1 @@
+No need to sen more test emails, but I want that fade of the background color as shown in the Apple_News_refernece.jpeg near the top.
