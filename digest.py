@@ -810,7 +810,7 @@ def render_html(digest, title, heading, date_label):
 
     row(f'<div style="font-family:{SANS};font-size:12px;line-height:1.4;color:#a0a0a0;margin-bottom:8px;">{e(date_label)}</div>'
         f'<h1 class="masthead" style="font-family:{SANS};font-size:30px;line-height:1.08;font-weight:750;'
-        f'letter-spacing:-0.5px;color:#f5f5f5;margin:0;">Good Morning<br>{e(heading)}</h1>', "32px 40px 22px")
+        f'letter-spacing:-0.5px;color:#f5f5f5;margin:0;">Good Morning<br>From {e(heading)}</h1>', "32px 40px 22px")
     if digest["tldr"]:
         row(f'<div style="font-family:{SERIF};font-size:18px;line-height:1.45;color:#b0b0b0;">{e(digest["tldr"])}</div>', "0 40px 24px")
     if digest["note"]:
