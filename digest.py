@@ -848,9 +848,10 @@ def render_html(digest, title, heading, date_label):
                 row('<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="table-layout:fixed;"><tr>'
                     f'<td valign="top">{headline(story)}{publisher(story)}</td>{thumb}</tr></table>'
                     + summary(story), "14px 40px 18px")
-    rule(strong=True)
-    row(f'<div style="font-family:{SANS};font-size:12px;line-height:1.5;color:#a0a0a0;">'
-        'Picked and summarized by AI from the day’s feeds. Tap a headline to read the full story.</div>', "16px 40px 30px")
+    # A full-width lighter band separates the disclosure, as in the reference email.
+    rows.append('<tr><td class="px" bgcolor="#2c2c2c" style="background-color:#2c2c2c;padding:24px 40px 30px;">'
+                f'<div style="font-family:{SANS};font-size:12px;line-height:1.5;color:#b0b0b0;">'
+                'Picked and summarized by AI from the day’s feeds. Tap a headline to read the full story.</div></td></tr>')
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark"><meta name="supported-color-schemes" content="dark">
