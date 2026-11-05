@@ -759,23 +759,15 @@ def fallback_digest(items):
 SANS = "-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',Roboto,Helvetica,Arial,sans-serif"
 SERIF = "ui-serif,'New York',Charter,Georgia,'Times New Roman',serif"
 
-# Light colors are inline; the <style> block swaps them for dark mode (iCloud Mail / Apple Mail honor it).
+# Dark reference palette is also inline for clients that strip the style block.
 DARK_CSS = """
-:root { color-scheme: light dark; supported-color-schemes: light dark; }
-@media (prefers-color-scheme: dark) {
-  .bg { background-color: #1c1c1e !important; }
-  .t1 { color: #f5f5f7 !important; }
-  .t2 { color: #c7c7cc !important; }
-  .t3 { color: #98989d !important; }
-  .red { color: #ff375f !important; }
-  .rule { border-color: #3a3a3c !important; }
-  .rule-strong { border-color: #636366 !important; }
-  .note { background-color: #3a2e05 !important; color: #ffd60a !important; }
-}
+:root { color-scheme: dark; supported-color-schemes: dark; }
 @media (max-width: 480px) {
-  .px { padding-left: 20px !important; padding-right: 20px !important; }
-  .title { font-size: 32px !important; }
-  .thumb { width: 76px !important; height: 76px !important; }
+  .px { padding-left: 22px !important; padding-right: 22px !important; }
+  .masthead { font-size: 26px !important; }
+  .section-title { font-size: 19px !important; }
+  .thumb-cell { width: 76px !important; }
+  .thumb { width: 64px !important; height: 64px !important; }
 }
 """
 
@@ -784,114 +776,90 @@ def render_html(digest, title, heading, date_label):
     e = html.escape
     rows = []
 
-    def row(content, pad="0 0 0 0", cls="px"):
-        rows.append(f'<tr><td class="{cls}" style="padding:{pad};">{content}</td></tr>')
+    def row(content, padding="18px 40px"):
+        rows.append(f'<tr><td class="px" style="padding:{padding};">{content}</td></tr>')
 
-    def primary(story):
-        """The link the headline points to (pass 2 may have switched to another source's article)."""
-        return next((l for l in story["links"] if l["url"] == story["url"]), story["links"][0])
-
-    def kicker(story):
-        if not story["links"]:
+    def publisher(story):
+        links = story["links"]
+        primary = next((link for link in links if link["url"] == story["url"]), links[0] if links else None)
+        if not primary:
             return ""
-        return (f'<div class="t3" style="font-family:{SANS};font-size:13px;font-weight:600;letter-spacing:0.01em;'
-                f'color:#6e6e73;margin:0 0 6px;">{e(primary(story)["source"])}</div>')
+        others = {source_key(link["source"]): link for link in links
+                  if source_key(link["source"]) != source_key(primary["source"])}
+        extra = ""
+        if others:
+            extra = '<br><span style="font-size:12px;">Also covered by ' + " &middot; ".join(
+                f'<a href="{e(link["url"])}" style="color:#a0a0a0;text-decoration:underline;">{e(link["source"])}</a>'
+                for link in others.values()) + '</span>'
+        return (f'<div style="font-family:{SANS};font-size:14px;line-height:1.4;color:#a0a0a0;'
+                f'margin-top:5px;">{e(primary["source"])}{extra}</div>')
 
-    def more_coverage(story):
-        if not story["links"]:
-            return ""
-        main = primary(story)["source"]
-        others = list({source_key(l["source"]): l for l in story["links"] if source_key(l["source"]) != source_key(main)}.values())
-        if not others:
-            return ""
-        links = " &middot; ".join(
-            f'<a href="{e(l["url"])}" class="t3" style="color:#6e6e73;text-decoration:underline;">{e(l["source"])}</a>'
-            for l in others
-        )
-        return (f'<div class="t3" style="font-family:{SANS};font-size:13px;line-height:1.5;color:#6e6e73;'
-                f'margin-top:10px;">Also covered by {links}</div>')
+    def headline(story, size=22):
+        return (f'<a href="{e(story["url"])}" style="font-family:{SERIF};font-size:{size}px;font-weight:700;'
+                f'line-height:1.2;color:#f5f5f5;text-decoration:none;">{e(story["headline"])}</a>')
 
-    def headline_link(story, size, weight="700"):
-        return (f'<a href="{e(story["url"])}" class="t1" style="font-family:{SERIF};font-size:{size}px;'
-                f'font-weight:{weight};line-height:1.25;color:#1d1d1f;text-decoration:none;">{e(story["headline"])}</a>')
-
-    def summary_div(story, color="#3a3a3c", font=SERIF, size=16):
+    def summary(story):
         if not story["summary"]:
             return ""
-        return (f'<div class="t2" style="font-family:{font};font-size:{size}px;line-height:1.5;color:{color};'
-                f'margin-top:6px;">{e(story["summary"])}</div>')
+        return (f'<div style="font-family:{SANS};font-size:16px;line-height:1.5;color:#b0b0b0;'
+                f'margin-top:7px;">{e(story["summary"])}</div>')
 
-    def divider(strong=False):
-        cls, width, color = ("rule-strong", 3, "#d2d2d7") if strong else ("rule", 1, "#e5e5ea")
-        return (f'<tr><td class="px" style="padding:0 24px;"><div class="{cls}" style="border-top:{width}px solid '
-                f'{color};font-size:0;line-height:0;">&nbsp;</div></td></tr>')
+    def rule(strong=False):
+        width, color = (2, "#999999") if strong else (1, "#484848")
+        row(f'<div style="border-top:{width}px solid {color};font-size:0;line-height:0;">&nbsp;</div>', "0 40px")
 
-    # Header: date kicker, big title, the day in brief.
-    row(f'<div class="t3" style="font-family:{SANS};font-size:13px;font-weight:700;letter-spacing:0.06em;'
-        f'text-transform:uppercase;color:#6e6e73;">{e(date_label)}</div>'
-        f'<div class="t1 title" style="font-family:{SANS};font-size:36px;font-weight:800;line-height:1.08;'
-        f'letter-spacing:-0.02em;color:#1d1d1f;margin-top:4px;">{e(heading)}</div>', "32px 24px 18px")
+    row(f'<div style="font-family:{SANS};font-size:12px;line-height:1.4;color:#a0a0a0;margin-bottom:8px;">{e(date_label)}</div>'
+        f'<h1 class="masthead" style="font-family:{SANS};font-size:30px;line-height:1.08;font-weight:750;'
+        f'letter-spacing:-0.5px;color:#f5f5f5;margin:0;">Good Morning<br>{e(heading)}</h1>', "32px 40px 22px")
     if digest["tldr"]:
-        row(f'<div class="t2" style="font-family:{SERIF};font-size:17px;line-height:1.5;color:#3a3a3c;">'
-            f'{e(digest["tldr"])}</div>', "0 24px 22px")
+        row(f'<div style="font-family:{SERIF};font-size:18px;line-height:1.45;color:#b0b0b0;">{e(digest["tldr"])}</div>', "0 40px 24px")
     if digest["note"]:
-        row(f'<div class="note" style="background-color:#fff4d6;border-radius:8px;padding:12px 14px;font-family:{SANS};'
-            f'font-size:14px;line-height:1.5;color:#7a4f00;">{e(digest["note"])}</div>', "0 24px 22px")
+        row(f'<div style="background-color:#303030;border-left:3px solid #a0a0a0;padding:12px;'
+            f'font-family:{SANS};font-size:14px;line-height:1.5;color:#d0d0d0;">{e(digest["note"])}</div>', "0 40px 22px")
 
-    for s_idx, section in enumerate(digest["sections"]):
-        top = s_idx == 0 and section["name"] == "Top stories"
-        rows.append(divider(strong=True))
-        color, cls = ("#d70015", "red") if top else ("#1d1d1f", "t1")
-        row(f'<div class="{cls}" style="font-family:{SANS};font-size:14px;font-weight:800;letter-spacing:0.16em;'
-            f'text-transform:uppercase;color:{color};">{e(section["name"])}</div>', "14px 24px 14px")
-
-        for i, story in enumerate(section["stories"]):
-            rows.append(divider())
-            if top and i == 0:
-                # Featured story: big image, large serif headline, sans summary.
-                img = (f'<a href="{e(story["url"])}"><img src="{e(story["image"])}" width="552" alt="" '
-                       f'style="display:block;width:100%;max-width:552px;height:auto;border:0;border-radius:6px;'
-                       f'margin-bottom:14px;"></a>') if story["image"] else ""
-                row(img + kicker(story) + headline_link(story, 26)
-                    + summary_div(story, color="#6e6e73", font=SANS, size=16).replace('class="t2"', 'class="t3"')
-                    + more_coverage(story), "18px 24px 20px")
-            elif top:
-                # Top stories: bold serif lead-in running into lighter text, like a news brief.
-                body = (f'<a href="{e(story["url"])}" class="t1" style="font-family:{SERIF};font-size:19px;'
-                        f'font-weight:700;line-height:1.42;color:#1d1d1f;text-decoration:none;">{e(story["headline"])}.</a>')
+    for section in digest["sections"]:
+        if not section["stories"]:
+            continue
+        top = section["name"] == "Top stories"
+        rule(strong=True)
+        color = "#ff375f" if top else "#f5f5f5"
+        row(f'<h2 class="section-title" style="font-family:{SANS};font-size:21px;font-weight:800;'
+            f'line-height:1.2;letter-spacing:1.5px;text-transform:uppercase;color:{color};margin:0;">'
+            f'{e(section["name"])}</h2>', "10px 40px 9px")
+        rule()
+        for index, story in enumerate(section["stories"]):
+            if index and not top:
+                rule()
+            if top:
+                # The reference leads with compact, text-first bullets rather than a hero image.
+                body = headline(story, 21)
                 if story["summary"]:
-                    body += (f' <span class="t3" style="font-family:{SERIF};font-size:19px;line-height:1.42;'
-                             f'color:#6e6e73;">{e(story["summary"])}</span>')
-                row(kicker(story) + f'<div style="line-height:1.42;">{body}</div>' + more_coverage(story),
-                    "16px 24px 18px")
+                    body += (f'<span style="font-family:{SERIF};font-size:19px;line-height:1.4;color:#b0b0b0;">'
+                             f' &mdash; {e(story["summary"])}</span>')
+                row('<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="table-layout:fixed;"><tr>'
+                    f'<td width="16" valign="top" style="color:#f5f5f5;font-size:19px;line-height:1.4;">&bull;</td>'
+                    f'<td style="line-height:1.4;">{body}{publisher(story)}</td></tr></table>', "12px 40px 10px")
             else:
-                # Section list: headline with a thumbnail on the right, paragraph below.
                 thumb = ""
                 if story["image"]:
-                    thumb = (f'<td width="88" valign="top" style="padding-left:14px;"><a href="{e(story["url"])}">'
-                             f'<img class="thumb" src="{e(story["image"])}" width="88" height="88" alt="" '
-                             f'style="display:block;width:88px;height:88px;object-fit:cover;border:0;border-radius:6px;">'
-                             f'</a></td>')
-                top_row = (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
-                           f'style="table-layout:fixed;"><tr>'
-                           f'<td valign="top">{kicker(story)}{headline_link(story, 20)}</td>{thumb}</tr></table>')
-                row(top_row + summary_div(story) + more_coverage(story), "16px 24px 18px")
-    rows.append(divider(strong=True))
-    row(f'<div class="t3" style="font-family:{SANS};font-size:12px;line-height:1.5;color:#6e6e73;">'
-        f'Picked and summarized by AI from the day\'s feeds. Tap a headline to read the full story.</div>',
-        "14px 24px 32px")
-
+                    thumb = (f'<td class="thumb-cell" width="100" valign="top" style="padding-left:12px;">'
+                             f'<a href="{e(story["url"])}"><img class="thumb" src="{e(story["image"])}" '
+                             'width="88" height="88" alt="" style="display:block;width:88px;height:88px;object-fit:cover;border:0;"></a></td>')
+                row('<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="table-layout:fixed;"><tr>'
+                    f'<td valign="top">{headline(story)}{publisher(story)}</td>{thumb}</tr></table>'
+                    + summary(story), "14px 40px 18px")
+    rule(strong=True)
+    row(f'<div style="font-family:{SANS};font-size:12px;line-height:1.5;color:#a0a0a0;">'
+        'Picked and summarized by AI from the day’s feeds. Tap a headline to read the full story.</div>', "16px 40px 30px")
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark"><meta name="supported-color-schemes" content="light dark">
+<meta name="color-scheme" content="dark"><meta name="supported-color-schemes" content="dark">
 <title>{e(title)}</title><style>{DARK_CSS}</style></head>
-<body class="bg" style="margin:0;padding:0;background-color:#ffffff;-webkit-text-size-adjust:100%;word-wrap:break-word;overflow-wrap:break-word;">
-<table role="presentation" class="bg" width="100%" cellpadding="0" cellspacing="0" style="background-color:#ffffff;"><tr><td align="center">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;table-layout:fixed;">
+<body bgcolor="#383838" style="margin:0;padding:0;background-color:#383838;-webkit-text-size-adjust:100%;word-wrap:break-word;overflow-wrap:break-word;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#383838" style="background-color:#383838;"><tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#1c1c1c" style="max-width:600px;table-layout:fixed;background-color:#1c1c1c;">
 {chr(10).join(rows)}
-</table>
-</td></tr></table>
-</body></html>
+</table></td></tr></table></body></html>
 """
 
 

@@ -79,15 +79,17 @@ The requested minimum is clamped to the available duplicate groups. A shorter se
 
 ### Email design
 
-The layout follows the style of a news-app morning briefing (reference screenshot in `design/reference.png`), without any third-party branding:
+The email follows `design/Apple_News_reference.jpeg`: a compact morning briefing with distinct black and gray tones. It retains **AI Daily News Digest** branding and includes no Apple logos or promotional modules.
 
-- **Header:** small uppercase date, then the big bold "AI Daily News Digest" title, then the TL;DR as a serif standfirst.
-- **Section headers:** small, bold, letter-spaced uppercase labels between a thick rule and a thin rule. "Top stories" is red; other sections are neutral.
-- **Top stories:** the first story is **featured** (full-width image, publisher, large serif headline, sans-serif summary). The rest use a **bold serif lead-in** (the headline) running into the lighter summary text.
-- **Other sections:** publisher above a serif headline with a **square thumbnail** on the right, the paragraph below at full width, thin dividers between stories.
-- **Publisher names** sit above each headline; extra sources are listed under the summary as "Also covered by …".
+- **Palette:** charcoal outer canvas `#383838`, near-black reading column `#1c1c1c`, bright headlines `#f5f5f5`, soft gray summaries `#b0b0b0`, muted source names `#a0a0a0`, thin dividers `#484848`, strong rules `#999999`, and pink Top Stories lettering `#ff375f`.
+- **Header:** small date, compact sans-serif “Good Morning” masthead and digest title, then a serif TL;DR.
+- **Top stories:** text-first bullets with bold serif headlines flowing into gray summaries. There is no large hero image.
+- **Other sections:** uppercase section titles, serif headlines with publisher credits below, square thumbnails on the right when available, and full-width gray summaries.
+- **Readability:** comfortable line heights intentionally avoid the overlapping text visible in the reference. Existing story content, source links, and plain-text email are preserved.
 
-**Email-safe HTML:** table layout with `table-layout:fixed` (so a large image can never widen the email past a phone screen), all styling inline, system fonts only: `-apple-system`/SF for sans, `ui-serif`/New York (falling back to Georgia) for serif. Light colors are inline; a `<style>` block with `@media (prefers-color-scheme: dark)` and `<meta name="color-scheme" content="light dark">` swaps in a dark palette, which iCloud Mail / Apple Mail on iPhone honor. A `max-width: 480px` media query tightens padding and type on phones.
+**Email-safe HTML:** presentation tables, a 600px maximum reading column, inline critical colors, `bgcolor` fallbacks, and system fonts. The reference's dark palette is the default in both light and dark system appearances; this replaces the previous adaptive white background. A mobile media query reduces padding, masthead size, and thumbnails. Clients may override colors or fonts, block remote images, or ignore image cropping; browser previews do not guarantee identical rendering in every mail client.
+
+**Offline preview:** run `.venv/bin/python digest.py --replay tests/fixtures/replay.json --output /private/tmp/digest-design-preview.html`. This renders saved content without API calls or sending mail. `digest.html` contains a representative synthetic multi-section design preview, not a live news edition.
 
 **Images:** for each story the first working one of: the feed item's `media:content` / `media:thumbnail` / image enclosure / first `<img>` in its HTML (`feed_image`), then the article's `og:image` (read during the article fetch). Every candidate is checked before use (`image_ok`: https, HTTP 200, `Content-Type: image/*`), and a story with no working image simply has no image block, so the email never shows a broken image box.
 
@@ -100,7 +102,7 @@ The layout follows the style of a news-app morning briefing (reference screensho
 | `digest.py` | The whole pipeline: fetch, filter, dedupe, pass 1, article fetching, pass 2 (with retry/fallback chain and hard cap), render, send. Also holds the LLM prompt, the section list, the primary and lite model defaults and the API base URL. |
 | `config.yaml` | Feeds and settings you'll edit most often (see [Configuration](#configuration-how-to-edit)). |
 | `requirements.txt` | Pinned dependencies: `feedparser`, `openai`, `python-dotenv`, `PyYAML`, `requests`, `trafilatura` (article text extraction). |
-| `design/` | `reference.png`, the screenshot the email layout is modeled on. Not used at runtime. |
+| `design/` | `Apple_News_reference.jpeg`, the current visual reference; `reference.png` is the older reference. Not used at runtime. |
 | `.github/workflows/daily-digest.yml` | The GitHub Actions workflow: `workflow_dispatch` trigger input (for cron-job.org), backup UTC crons, send-window check, Python setup, secrets → env vars, runs `python digest.py`, emails you if a run fails. |
 | `send_window.py` | Decides whether a scheduled run (GitHub cron or `trigger=external-schedule`) sends: inside 7:45–10:00 AM Chicago and nothing sent yet today. Standard library only. |
 | `prompts/` | The step-by-step build prompts used to create this project with Claude Code (`prompt_0_brief.md` … `prompt_11_redesign.md`). History only; nothing reads them at runtime. |
