@@ -857,7 +857,7 @@ def render_html(digest, title, heading, date_label):
 <title>{e(title)}</title><style>{DARK_CSS}</style></head>
 <body bgcolor="#383838" style="margin:0;padding:0;background-color:#383838;-webkit-text-size-adjust:100%;word-wrap:break-word;overflow-wrap:break-word;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#383838" style="background-color:#383838;"><tr><td align="center">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#1c1c1c" style="max-width:600px;table-layout:fixed;background-color:#1c1c1c;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#1c1c1c" style="max-width:600px;table-layout:fixed;background-color:#1c1c1c;background-image:linear-gradient(to bottom,#2c2c2e 0px,#232324 70px,#1c1c1c 160px);background-repeat:no-repeat;">
 {chr(10).join(rows)}
 </table></td></tr></table></body></html>
 """
