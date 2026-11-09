@@ -864,6 +864,37 @@ def render_html(digest, title, heading, date_label):
 """
 
 
+def build_subject(digest, fallback):
+    """Tease up to three lead topics using the digest's editorial order."""
+    headlines = []
+    seen = set()
+    for section in digest["sections"]:
+        for story in section["stories"]:
+            headline = " ".join(story["headline"].split()).rstrip(" .!?")
+            key = headline.casefold()
+            if headline and key not in seen:
+                headlines.append(headline)
+                seen.add(key)
+
+    if not headlines:
+        return fallback
+
+    topics = []
+    for headline in headlines[:3]:
+        candidate = ", ".join([*topics, headline])
+        suffix = ", and more" if len(topics) + 1 < len(headlines) else ""
+        if topics and len(candidate + suffix) > 110:
+            break
+        topics.append(headline)
+
+    if len(topics) < len(headlines):
+        return ", ".join([*topics, "and more"])
+    if len(topics) == 1:
+        return topics[0]
+    separator = " and " if len(topics) == 2 else ", and "
+    return separator.join([", ".join(topics[:-1]), topics[-1]])
+
+
 def render_text(digest, title):
     lines = [title, ""]
     if digest["note"]:
@@ -1014,9 +1045,10 @@ def main():
 
         date_label = f"{now:%A, %B} {now.day}"
         email_config = config["email"]
-        subject = f"{email_config['subject_prefix']} — {date_label}"
-        html_body = render_html(digest, subject, email_config["subject_prefix"], date_label)
-        text_body = render_text(digest, subject)
+        title = f"{email_config['subject_prefix']} — {date_label}"
+        subject = build_subject(digest, title)
+        html_body = render_html(digest, title, email_config["subject_prefix"], date_label)
+        text_body = render_text(digest, title)
 
         if args.dry_run:
             out = Path(args.output)
