@@ -165,7 +165,7 @@ The token lives **only in cron-job.org**. Never put it in the repo, this README 
 1. cron-job.org: the job's time and time zone.
 2. `.github/workflows/daily-digest.yml`: the UTC backup crons. Pick hours that cover your target local time in both standard and daylight time.
 3. `send_window.py`: `TZ`, `WINDOW_START` and `WINDOW_END`.
-4. `config.yaml`: `settings.timezone` (used for the date in the subject and heading, and in the receipt step's name).
+4. `config.yaml`: `settings.timezone` (used for the date in the email heading, and in the receipt step's name).
 
 **GitHub cron runs can start late.** GitHub queues scheduled runs, and they often start minutes or hours after the cron time, or never. That's why it's only the backup. Scheduled runs only fire from the default branch (`main`).
 
@@ -182,7 +182,7 @@ The job runs on `ubuntu-latest` with Python 3.13, caches pip, and has a **20-min
 | Key | Current value | Controls |
 | --- | --- | --- |
 | `settings.lookback_hours` | `26` | How far back to keep items. 26 rather than 24 gives slack for late runs and odd feed timestamps. |
-| `settings.timezone` | `America/Chicago` | Time zone for the date in the subject and email heading. Does **not** control when the workflow runs. |
+| `settings.timezone` | `America/Chicago` | Time zone for the date in the email heading. Does **not** control when the workflow runs. |
 | `settings.request_timeout` | `20` | Seconds per feed request. |
 | `settings.article_timeout` | `10` | Seconds per article page, Google News link decode and image check (pass 2 prep). |
 | `settings.article_chars` | `4000` | Article text sent to the LLM per story. |
@@ -194,7 +194,7 @@ The job runs on `ubuntu-latest` with Python 3.13, caches pip, and has a **20-min
 | `settings.llm_final_wait` | `300` | Seconds to wait before the last try of the primary model (shortened if needed to fit the cap). |
 | `settings.llm_step_cap` | `600` | Hard cap on the whole LLM step (both passes and article fetching), in seconds. |
 | `settings.user_agent` | browser UA string | Sent with feed requests; some sites block default Python agents. |
-| `email.subject_prefix` | `AI Daily News Digest` | Subject is `<prefix> — <Weekday, Month Day>`. Also the big heading at the top of the email. |
+| `email.subject_prefix` | `AI Daily News Digest` | Digest name used in the masthead and in the fallback subject when no headline is available. |
 | `email.from_name` | `AI News` | Display name on the From line. |
 | `email.to_name` | `Noah Sher` | Display name on the To line. |
 | `feeds[]` | 13 feeds | Each has `name` (shown in the email), `url` and `max_items` (cap per run). Optional: `snippet_chars` (snippet length sent to the LLM, default 300), `strip_publisher: true` (Google News: strip ` - Publisher` from titles and show the publisher as the source), `expand_issue: true` (TLDR: create separate story items from its web page). |
@@ -251,7 +251,9 @@ SECTIONS = ["Top stories", "AI models & labs", "Industry & funding", "Policy & s
 
 Edit the list. The prompt passes it to the model in order and tells it to omit empty sections. The rule that "Top stories" holds the 3–4 biggest stories is in `PROMPT` just below; update it if you rename or remove that section.
 
-### Change the subject prefix, From name or To name
+The email subject previews up to three lead headlines in editorial order. It keeps the full lead headline and adds other topics within a 110-character target, ending with “and more” when the edition contains additional stories. The subject is built from the finished digest without another model call.
+
+### Change the digest name, From name or To name
 
 ```yaml
 email:
