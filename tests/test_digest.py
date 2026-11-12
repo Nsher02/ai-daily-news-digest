@@ -1,8 +1,10 @@
+import json
+import smtplib
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import yaml
 
 import digest
@@ -33,6 +35,74 @@ class DeliveryTests(unittest.TestCase):
                 outcomes = [line for line in output.read_text().splitlines() if line.startswith('outcome=')]
                 self.assertEqual(outcomes[-1], 'outcome=' + expected)
                 self.assertEqual(send.call_count, 0 if dry else 1)
+
+    def test_send_email_adds_tracking_metadata(self):
+        env = {'SMTP_HOST': 'smtp.example.com', 'SMTP_PORT': '587', 'SMTP_USER': 'digest@example.com',
+               'SMTP_PASSWORD': 'secret', 'EMAIL_FROM': 'digest@example.com', 'EMAIL_TO': 'reader@example.com'}
+        with patch.dict('os.environ', env, clear=True):
+            with patch.object(smtplib, 'SMTP') as smtp_ctor:
+                smtp = smtp_ctor.return_value.__enter__.return_value
+                delivery = digest.send_email('Test digest', 'text', '<p>html</p>', {'from_name': 'AI Digest', 'to_name': 'Reader'}, digest_date='2026-12-15')
+                msg = smtp.send_message.call_args[0][0]
+                self.assertTrue(msg['Message-ID'].startswith('<'))
+                self.assertTrue(msg['Message-ID'].endswith('>'))
+                self.assertRegex(msg['X-Digest-Edition'], r'^digest-2026-12-15-scheduled-[a-f0-9]{12}$')
+                self.assertEqual(msg['X-Digest-Inbox-Delivery'], 'unknown')
+                self.assertEqual(delivery['delivery_status'], 'smtp_accepted')
+                self.assertEqual(delivery['delivery_evidence'], 'smtp_server_acceptance')
+                self.assertEqual(delivery['inbox_delivery'], 'unknown')
+
+    def test_smtp_rejections_are_reported_as_failed(self):
+        env = {'SMTP_HOST': 'smtp.example.com', 'SMTP_PORT': '587', 'SMTP_USER': 'digest@example.com',
+               'SMTP_PASSWORD': 'secret', 'EMAIL_FROM': 'digest@example.com', 'EMAIL_TO': 'reader@example.com'}
+        with patch.dict('os.environ', env, clear=True):
+            with patch.object(smtplib, 'SMTP', side_effect=RuntimeError('SMTP rejected')):
+                with self.assertRaises(RuntimeError):
+                    digest.send_email('Test digest', 'text', '<p>html</p>', {'from_name': 'AI Digest', 'to_name': 'Reader'}, digest_date='2026-12-15')
+
+    def test_prepared_editions_are_persisted_and_manual_ids_are_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'prepared.json'
+            scheduled = digest.build_delivery_metadata('2026-12-15', 'News', {'from_name': 'AI News', 'to_name': 'Reader'}, mode='scheduled')
+            scheduled['text_body'] = 'text'
+            scheduled['html_body'] = '<p>html</p>'
+            digest.persist_prepared_edition(scheduled, path=str(path))
+            loaded = digest.load_prepared_edition(path=str(path), digest_date='2026-12-15')
+            self.assertEqual(loaded['edition_id'], scheduled['edition_id'])
+            self.assertEqual(loaded['mode'], 'scheduled')
+            self.assertEqual(loaded['text_body'], 'text')
+
+            manual = digest.build_delivery_metadata('2026-12-15', 'News', {'from_name': 'AI News', 'to_name': 'Reader'}, mode='manual')
+            self.assertNotEqual(scheduled['edition_id'], manual['edition_id'])
+            accepted = {'delivery_status': 'smtp_accepted', 'digest_date': '2026-12-15', 'mode': 'scheduled', 'subject': 'News', 'recipient': 'reader@example.com'}
+            self.assertFalse(digest.should_retry_prepared_edition(accepted, '2026-12-15', 'scheduled', subject='News', recipient='reader@example.com'))
+            failed = {'delivery_status': 'failed', 'digest_date': '2026-12-15', 'mode': 'scheduled', 'subject': 'News', 'recipient': 'reader@example.com'}
+            self.assertTrue(digest.should_retry_prepared_edition(failed, '2026-12-15', 'scheduled', subject='News', recipient='reader@example.com'))
+
+    def test_corrupted_prepared_edition_blocks_unsafe_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'prepared.json'
+            path.write_text('{bad json', encoding='utf-8')
+            with self.assertRaises(ValueError):
+                digest.load_prepared_edition(path=str(path))
+
+    def test_ai_subject_is_handled_in_same_summary_payload(self):
+        payload = json.dumps({
+            'subject': 'A new open model, the debate over AI safety rules, and more',
+            'tldr': 'Final brief',
+            'stories': [{'n': 1, 'headline': 'Open model launch', 'summary': 'Short summary'}],
+        })
+        parsed = digest.parse_summaries(payload, 1)
+        self.assertEqual(parsed['subject'], 'A new open model, the debate over AI safety rules, and more')
+        final = digest.apply_rewrites({'sections': [{'stories': [{'headline': 'Open model launch', 'summary': 'Old summary'}]}]}, parsed)
+        self.assertEqual(final['subject'], parsed['subject'])
+        self.assertEqual(digest.build_subject({'subject': parsed['subject'], 'sections': []}, 'fallback'), parsed['subject'])
+
+    def test_invalid_subject_falls_back_to_headline_summary(self):
+        digest_data = {'sections': [{'stories': [{'headline': 'Open model launch', 'summary': 'Short summary'}]}], 'subject': 'X' * 200}
+        self.assertEqual(digest.build_subject(digest_data, 'fallback subject'), 'Open model launch')
+        self.assertEqual(digest.build_subject({'sections': [{'stories': [{'headline': 'Open model launch'}]}]}, 'fallback'), 'Open model launch')
+
 
 def utc(stamp):
     return datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc)
@@ -126,7 +196,7 @@ class SendWindowTests(unittest.TestCase):
         fake = lambda path: pages['runs'] if '/workflows/' in path else pages[int(path.split('/runs/')[1].split('/')[0])]
         with patch.object(send_window, 'gh_json', side_effect=fake):
             runs = send_window.recent_runs('owner/repo', utc('2026-12-15T14:23'), '8')
-        self.assertEqual(runs, [{'id': 7, 'event': 'schedule', 'started': '2026-12-15T13:53:00Z', 'markers': {'SMTP accepted: 2026-12-15'}}])
+        self.assertEqual(runs, [{'id': 7, 'event': 'schedule', 'started': '2026-12-15T13:53:00Z', 'markers': {'SMTP accepted: 2026-12-15'}, 'status': None, 'conclusion': None}])
 
 
 def news(title, url, source='Publisher', summary=''):
@@ -296,6 +366,41 @@ class IntegrationTests(unittest.TestCase):
                         send_window.main()
                 self.assertEqual('skip=true' in output.read_text(), bool(skip))
 
+class MonitoringTests(unittest.TestCase):
+    def test_missing_digest_alert_after_cutoff_without_receipt(self):
+        now = datetime(2026, 11, 12, 16, 5, tzinfo=timezone.utc)
+        runs = [{"id": 11, "event": "schedule", "started": "2026-11-12T15:30:00Z", "status": "completed", "markers": set()}]
+        result = send_window.evaluate_monitor(now, runs=runs, quality_history=[], threshold=2)
+        self.assertEqual(result["missing_digest"]["status"], "missing_digest")
+        self.assertEqual(result["alerts"][0]["alert_id"], result["missing_digest"]["alert_id"])
+
+    def test_missing_digest_waits_for_active_run(self):
+        now = datetime(2026, 11, 12, 16, 5, tzinfo=timezone.utc)
+        runs = [{"id": 12, "event": "schedule", "started": "2026-11-12T15:59:00Z", "status": "in_progress", "markers": set()}]
+        result = send_window.evaluate_monitor(now, runs=runs, quality_history=[], threshold=2)
+        self.assertEqual(result["missing_digest"]["status"], "pending_active_run")
+
+    def test_quality_streak_alert_tracks_consecutive_degraded_runs(self):
+        now = datetime(2026, 11, 12, 16, 5, tzinfo=timezone.utc)
+        quality_history = [
+            {"digest_date": "2026-11-12", "quality": "partial_pass_2"},
+            {"digest_date": "2026-11-11", "quality": "raw_headlines"},
+        ]
+        result = send_window.evaluate_monitor(now, runs=[], quality_history=quality_history, threshold=2)
+        self.assertEqual(result["degraded_quality"]["status"], "degraded_quality")
+        self.assertEqual(result["degraded_quality"]["count"], 2)
+
+    def test_duplicate_alerts_are_filtered_by_stable_id(self):
+        alert = {"status": "missing_digest", "digest_date": "2026-11-12", "alert_id": "digest-alert-missing-2026-11-12-abc123"}
+        self.assertEqual(send_window.dedupe_alerts([alert, alert]), [alert])
+
+    def test_manual_success_and_recent_receipt_skip_missing_alerts(self):
+        now = datetime(2026, 11, 12, 16, 5, tzinfo=timezone.utc)
+        runs = [{"id": 99, "event": "workflow_dispatch", "started": "2026-11-12T15:40:00Z", "status": "completed", "markers": {"SMTP accepted: 2026-11-12"}}]
+        result = send_window.evaluate_monitor(now, runs=runs, quality_history=[], threshold=2)
+        self.assertIsNone(result["missing_digest"])
+
+
 class GroundingTests(unittest.TestCase):
     def test_generated_headline_is_not_evidence(self):
         items = [news('Original title', 'https://example.com', summary='Original evidence')]
@@ -313,6 +418,37 @@ class GroundingTests(unittest.TestCase):
             {'n': 1, 'headline': 'Duplicate', 'summary': 'Duplicate'},
             {'n': 2, 'summary': 'Missing headline'}, None]}), 2)
         self.assertEqual(parsed['stories'], {1: {'headline': 'Corrected', 'summary': 'Grounded'}})
+
+
+class PageAccessTests(unittest.TestCase):
+    def test_login_and_bot_pages_are_rejected(self):
+        settings = digest.load_config()['settings']
+        for status, html, reason in [
+            (403, '<html>please log in to continue</html>', 'login_required'),
+            (200, '<html>verify you are human and complete the challenge</html>', 'bot_challenge'),
+        ]:
+            response = Mock(status_code=status, text=html, url='https://example.com/page', headers={})
+            with self.subTest(reason=reason), patch.object(digest.requests, 'get', return_value=response):
+                with self.assertRaises(digest.ArticleAccessError) as err:
+                    digest.fetch_article('https://example.com/page', settings)
+                self.assertEqual(err.exception.reason, reason)
+
+    def test_soft_paywall_mentions_do_not_reject_public_text(self):
+        settings = digest.load_config()['settings']
+        response = Mock(status_code=200, text='<html>Article body</html>', url='https://example.com/public', headers={'Content-Type': 'text/html'})
+        with patch.object(digest.requests, 'get', return_value=response), patch.object(digest.trafilatura, 'extract', return_value=('A public article about a paywall experiment. ' * 20).strip()):
+            text, image = digest.fetch_article('https://example.com/public', settings)
+            self.assertIn('public article', text)
+            self.assertEqual(image, '')
+
+    def test_enrich_story_tries_next_source_when_one_article_is_blocked(self):
+        item_blocked = news('Blocked story', 'https://blocked.example/story', 'Blocked News')
+        item_ok = news('The story', 'https://good.example/story', 'Good News')
+        story = {'links': [{'source': 'Blocked News', 'url': 'https://blocked.example/story'}, {'source': 'Good News', 'url': 'https://good.example/story'}], 'ids': [0, 1]}
+        with patch.object(digest, 'fetch_article', side_effect=[digest.ArticleAccessError('login_required', 'blocked'), ('Public article text ' * 20, 'https://good.example/img')]):
+            result = digest.enrich_story(story, [item_blocked, item_ok], digest.load_config()['settings'])
+        self.assertEqual(result['article']['source'], 'Good News')
+        self.assertIsNone(result['article_reason'])
 
 
 class DeadlineTests(unittest.TestCase):
@@ -422,6 +558,48 @@ class ReplayAndMetricsTests(unittest.TestCase):
         self.assertEqual(rewritten['tldr'], 'Initial brief')
         self.assertEqual(rewritten['sections'][0]['stories'][1]['headline'], 'Second headline')
         self.assertEqual(rewritten['quality'], 'partial_pass_2')
+
+
+class StoryHistoryTests(unittest.TestCase):
+    def test_recently_emailed_story_is_suppressed_with_exact_matches(self):
+        settings = {'story_history_hours': 72}
+        history = [{'edition': (datetime.now(timezone.utc) - timedelta(hours=1)).date().isoformat(),
+                    'urls': ['https://www.example.com/story?utm_campaign=1#top'],
+                    'titles': ['launch announcement']}]
+        item = news('Launch announcement', 'https://example.com/story?utm_campaign=1#top', 'Publisher')
+        self.assertEqual(digest.apply_story_history_filter([item], settings, history), [])
+
+    def test_new_story_is_kept_and_quiet_days_do_not_pad(self):
+        settings = {'story_history_hours': 72}
+        history = [{'edition': (datetime.now(timezone.utc) - timedelta(hours=5)).date().isoformat(),
+                    'urls': ['https://example.com/old-story'],
+                    'titles': ['old launch']}]
+        items = [news('Old launch', 'https://example.com/old-story', 'Publisher'),
+                 news('New update', 'https://example.com/new-story', 'Publisher')]
+        filtered = digest.apply_story_history_filter(items, settings, history)
+        self.assertEqual([item['link'] for item in filtered], ['https://example.com/new-story'])
+        self.assertEqual(digest.apply_story_history_filter([items[0]], settings, history), [])
+
+    def test_history_restore_is_lenient_and_saves_sent_records(self):
+        settings = {'story_history_hours': 72, 'story_history_max_entries': 10}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'story-history.json'
+            path.write_text('{bad json')
+            self.assertEqual(digest.load_story_history(path=path, settings=settings), [])
+            digest.record_accepted_story_history({'sections': [{'stories': [{'headline': 'Beta launch',
+                                                                           'links': [{'source': 'Publisher', 'url': 'https://example.com/beta'}]}]}]},
+                                                '2026-11-12', settings=settings, path=path)
+            loaded = digest.load_story_history(path=path, settings=settings)
+            self.assertTrue(any('https://example.com/beta' in entry['urls'] for entry in loaded))
+
+    def test_manual_sends_bypass_history_suppression(self):
+        settings = {'story_history_hours': 72}
+        history = [{'edition': (datetime.now(timezone.utc) - timedelta(hours=2)).date().isoformat(),
+                    'urls': ['https://example.com/manual-story'],
+                    'titles': ['manual story']}]
+        item = news('Manual story', 'https://example.com/manual-story', 'Publisher')
+        with patch.dict('os.environ', {'TRIGGER': 'manual'}, clear=False):
+            self.assertEqual(digest.apply_story_history_filter([item], settings, history), [item])
 
 
 class WorkerProcessTests(unittest.TestCase):
