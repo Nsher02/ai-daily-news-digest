@@ -221,3 +221,6 @@ __marimo__/
 
 # Claude Code local settings
 .claude/
+
+# Private prepared editions and accepted-story history
+.digest-state/

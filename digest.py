@@ -3,6 +3,7 @@
 import argparse
 import calendar
 import copy
+import hashlib
 import html
 import json
 import logging
@@ -17,7 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from email.utils import formataddr
+from email.utils import formataddr, format_datetime, make_msgid
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -75,7 +76,11 @@ For each numbered story below, write ONE paragraph:
 - Plain, neutral, factual prose. No bullet points, no hype, no "the article says".
 
 Return ONLY JSON in this exact shape, one entry per story:
-{{"tldr": "...", "stories": [{{"n": 1, "headline": "...", "summary": "..."}}]}}
+{{"subject": "...", "tldr": "...", "stories": [{{"n": 1, "headline": "...", "summary": "..."}}]}}
+
+- "subject" must be a short editorial summary in 2-3 topic phrases, natural sentence casing, and under 110 characters.
+- Keep it grounded in the selected stories' original feed evidence and article text only; no digest-name prefix and no hype, dates, or unsupported claims.
+- If there are more important stories beyond the first 2-3, end with "and more".
 
 {stories}"""
 
@@ -279,6 +284,236 @@ def source_key(source):
     return re.sub(r"\W+", "", source.casefold())
 
 
+def story_history_hours(settings):
+    return int(settings.get("story_history_hours",
+                           settings.get("history_hours",
+                                        settings.get("sent_history_hours", 72))))
+
+
+def story_history_limit(settings):
+    return int(settings.get("story_history_max_entries",
+                           settings.get("history_max_entries", 500)))
+
+
+def history_path_for(settings=None, path=None):
+    if path is not None:
+        target = Path(path)
+        return target if target.is_absolute() else (Path(__file__).resolve().parent / target)
+    env_path = os.environ.get("DIGEST_HISTORY_PATH") or os.environ.get("STORY_HISTORY_PATH")
+    if env_path:
+        target = Path(env_path)
+        return target if target.is_absolute() else (Path(__file__).resolve().parent / target)
+    settings = settings or load_config()["settings"]
+    for key in ("story_history_path", "history_path", "sent_history_path"):
+        if settings.get(key):
+            target = Path(settings[key])
+            return target if target.is_absolute() else (Path(__file__).resolve().parent / target)
+    return None
+
+
+def parse_history_date(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            return datetime.fromtimestamp(raw, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def normalize_history_record(entry):
+    if not isinstance(entry, dict):
+        return None
+    candidate = {"edition": entry.get("edition") or entry.get("date") or entry.get("digest_date"),
+                 "title": entry.get("title") or "",
+                 "urls": entry.get("urls") or [],
+                 "titles": entry.get("titles") or []}
+    if isinstance(candidate["urls"], str):
+        candidate["urls"] = [candidate["urls"]]
+    if not isinstance(candidate["urls"], list):
+        candidate["urls"] = []
+    if isinstance(candidate["titles"], str):
+        candidate["titles"] = [candidate["titles"]]
+    if not isinstance(candidate["titles"], list):
+        candidate["titles"] = []
+    candidate["urls"] = [normalize_url(url) for url in candidate["urls"] if isinstance(url, str) and url.strip()]
+    candidate["titles"] = [normalize_title(title) for title in candidate["titles"] if isinstance(title, str) and title.strip()]
+    candidate["title"] = candidate["title"] if isinstance(candidate["title"], str) else ""
+    candidate["source_evidence"] = entry.get("source_evidence", [])
+    if candidate["title"] and normalize_title(candidate["title"]):
+        candidate["titles"].append(normalize_title(candidate["title"]))
+    candidate["titles"] = list(dict.fromkeys(t for t in candidate["titles"] if t))
+    candidate["urls"] = list(dict.fromkeys(u for u in candidate["urls"] if u))
+    return candidate if candidate["urls"] or candidate["titles"] or candidate["edition"] else None
+
+
+def load_story_history(path=None, settings=None):
+    target = history_path_for(settings=settings, path=path)
+    if target is None or not target.exists():
+        return []
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        log.warning("story history unavailable or corrupt at %s; resetting", target)
+        return []
+    if isinstance(raw, dict):
+        entries = raw.get("entries", raw.get("history", []))
+    elif isinstance(raw, list):
+        entries = raw
+    else:
+        return []
+    if not isinstance(entries, list):
+        return []
+    valid = []
+    for entry in entries:
+        try:
+            record = normalize_history_record(entry)
+        except (TypeError, ValueError):
+            log.warning("ignoring malformed story-history record")
+            continue
+        if record is None:
+            continue
+        date = parse_history_date(record["edition"])
+        if date is not None:
+            record["_date"] = date
+        valid.append(record)
+    horizon = story_history_hours(settings or {})
+    if horizon > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=horizon)
+        valid = [entry for entry in valid if parse_history_date(entry.get("edition")) and parse_history_date(entry["edition"]) >= cutoff]
+    return [{k: v for k, v in entry.items() if not k.startswith("_")} for entry in valid]
+
+
+def save_story_history(entries, path=None, settings=None):
+    target = history_path_for(settings=settings, path=path)
+    if target is None:
+        return None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    serializable = [{k: v for k, v in entry.items() if not k.startswith("_")} for entry in entries if isinstance(entry, dict)]
+    payload = {"version": 1, "entries": serializable[:story_history_limit(settings or {})]}
+    temp = target.parent / f"{target.name}.tmp"
+    with open(temp, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, indent=2, sort_keys=True))
+    os.replace(temp, target)
+    return target
+
+
+def append_story_history(entry, path=None, settings=None):
+    target = history_path_for(settings=settings, path=path)
+    entries = load_story_history(path=target, settings=settings)
+    entry = normalize_history_record(entry)
+    if entry is None:
+        return entries
+    if entry.get("edition") is None:
+        entry["edition"] = datetime.now(timezone.utc).date().isoformat()
+    entries.append(entry)
+    entries = sorted(entries, key=lambda e: parse_history_date(e.get("edition")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return save_story_history(entries[:story_history_limit(settings or {})], path=target, settings=settings)
+
+
+def accepted_story_history_for(digest, digest_date):
+    records = []
+    for section in digest.get("sections", []):
+        for story in section.get("stories", []):
+            headline = story.get("headline") or ""
+            urls = list(story.get("original_urls", []))
+            seen = set(urls)
+            for link in story.get("links", []) or []:
+                url = link.get("url") or story.get("url")
+                if not url or not isinstance(url, str):
+                    continue
+                norm = normalize_url(url)
+                if norm and norm not in seen:
+                    seen.add(norm)
+                    urls.append(norm)
+            if not urls and story.get("url"):
+                urls = [normalize_url(story["url"])]
+            title_key = normalize_title(headline)
+            source_evidence = []
+            for link in story.get("links", []) or []:
+                source = link.get("source") or ""
+                url = link.get("url") or story.get("url")
+                if not url:
+                    continue
+                source_evidence.append({"source": source, "url": normalize_url(url), "title": headline})
+            records.append({
+                "edition": digest_date,
+                "title": headline,
+                "urls": urls,
+                "titles": list(dict.fromkeys([title_key, *story.get("original_titles", [])])),
+                "source_evidence": source_evidence,
+            })
+    return records
+
+
+def is_manual_run():
+    return os.environ.get("TRIGGER") == "manual" or os.environ.get("MANUAL_RUN") == "1"
+
+
+def story_matches_history(item, history):
+    urls = {normalize_url(entry["link"]) for entry in item_evidence(item) if entry.get("link")}
+    titles = {normalize_title(entry.get("title") or "") for entry in item_evidence(item)}
+    for record in history:
+        if urls.intersection(normalize_url(url) for url in record.get("urls", [])):
+            return True
+        if titles.intersection(normalize_title(title) for title in record.get("titles", [])):
+            return True
+    return False
+
+
+def apply_story_history_filter(items, settings=None, history=None, manual=False):
+    if manual or is_manual_run() or not items:
+        return list(items)
+    if history is None:
+        history = load_story_history(settings=settings)
+    if not history:
+        return list(items)
+    horizon = story_history_hours(settings or {})
+    if horizon <= 0:
+        return list(items)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=horizon)
+    fresh = []
+    for record in history:
+        date = parse_history_date(record.get("edition"))
+        if date is not None and date >= cutoff:
+            fresh.append(record)
+    if not fresh:
+        return list(items)
+    filtered = []
+    for item in items:
+        if not story_matches_history(item, fresh):
+            filtered.append(item)
+    return filtered
+
+
+def record_accepted_story_history(digest, digest_date, settings=None, path=None):
+    if not digest or not digest.get("sections"):
+        return []
+    target = history_path_for(settings=settings, path=path)
+    if target is None:
+        return []
+    history = load_story_history(path=target, settings=settings)
+    records = accepted_story_history_for(digest, digest_date)
+    history.extend(records)
+    history = sorted(history, key=lambda e: parse_history_date(e.get("edition")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    save_story_history(history[:story_history_limit(settings or {})], path=target, settings=settings)
+    return history
+
+
 def item_evidence(item):
     return item.get("evidence", [item])
 
@@ -401,7 +636,9 @@ def parse_digest(content, items, settings=None):
             if not links:
                 continue
             stories.append({"headline": headline.strip(), "summary": summary.strip(),
-                            "url": links[0]["url"], "links": links, "ids": ids, "image": ""})
+                            "url": links[0]["url"], "links": links, "ids": ids, "image": "",
+                            "original_urls": [normalize_url(link["url"]) for link in links],
+                            "original_titles": [normalize_title(entry["title"]) for i in ids for entry in item_evidence(items[i])]})
             used.update(ids)
             headlines.add(headline_key)
             total += 1
@@ -531,13 +768,65 @@ def decode_google_news(url, settings, deadline=None):
         return None
 
 
+class ArticleAccessError(RuntimeError):
+    def __init__(self, reason, message=None):
+        self.reason = reason
+        super().__init__(message or reason)
+
+
+def access_block_reason(url, html_text, final_url=None, status_code=None):
+    if status_code == 401:
+        return "login_required"
+    if status_code == 403:
+        if "log in to continue" in html_text.lower() or "sign in to continue" in html_text.lower():
+            return "login_required"
+        return "access_restricted"
+    if status_code == 429:
+        return "access_restricted"
+    path = urlsplit(final_url or url).path.lower().rstrip("/")
+    if re.search(r"/(?:login|signin|sign-in)(?:/|$)", path):
+        return "login_required"
+    if re.search(r"/(?:subscribe|subscription)(?:/|$)", path):
+        return "paywall"
+    # Titles and leading page headings are stronger signals than incidental words in scripts/body.
+    headings = re.findall(r"<(?:title|h1)\b[^>]*>(.*?)</(?:title|h1)>", html_text, re.I | re.S)
+    prominent = " ".join(clean_text(heading, 300) for heading in headings).lower()
+    if not headings and len(clean_text(html_text, 301)) < 300:
+        prominent = clean_text(html_text, 300).lower()
+    if any(token in prominent for token in ("verify you are human", "captcha", "just a moment", "access denied", "checking your browser")):
+        return "bot_challenge"
+    if any(token in prominent for token in ("log in", "sign in", "member login")):
+        return "login_required"
+    if any(token in prominent for token in ("subscribe to continue", "subscription required", "premium article", "paid article")):
+        return "paywall"
+    return None
+
+
 def fetch_article(url, settings, deadline=None):
-    """Main text (trimmed) and og:image of an article page."""
+    """Extract public article text and reject access barriers conservatively."""
     resp = requests.get(url, timeout=remaining_timeout(settings, deadline), headers={"User-Agent": settings["user_agent"]})
+    status = resp.status_code
+    final_url = resp.url or url
+    reason = access_block_reason(url, resp.text, final_url=final_url, status_code=status)
+    if reason:
+        raise ArticleAccessError(reason, f"unavailable article access for {url}")
     resp.raise_for_status()
-    text = trafilatura.extract(resp.text, url=url, include_comments=False, include_tables=False) or ""
+    if "html" not in resp.headers.get("Content-Type", "text/html").lower():
+        raise ArticleAccessError("unsupported_content", f"non-HTML article for {url}")
+    text = trafilatura.extract(resp.text, url=final_url, include_comments=False, include_tables=False) or ""
+    cleaned = " ".join(text.split())
+    # A short extracted subscription/login message is not evidence for a long summary.
+    if len(cleaned) < 300:
+        lowered = cleaned.lower()
+        if "subscribe to continue" in lowered or "subscription required" in lowered:
+            reason = "paywall"
+        elif "sign in to continue" in lowered or "log in to continue" in lowered:
+            reason = "login_required"
+        else:
+            reason = "insufficient_text"
+        raise ArticleAccessError(reason, f"insufficient public article text for {url}")
     meta = trafilatura.extract_metadata(resp.text)
-    image = urljoin(url, meta.image) if meta and meta.image else ""
+    image = urljoin(final_url, meta.image) if meta and meta.image else ""
     return text[: settings["article_chars"]], image
 
 
@@ -564,6 +853,10 @@ def is_tldr_issue(url):
 
 def enrich_story(story, items, settings, deadline=None):
     """Resolve Google News links, fetch the best article's text, and pick a working image."""
+    story["original_urls"] = list(dict.fromkeys(normalize_url(entry["link"]) for i in story["ids"]
+                                               for entry in item_evidence(items[i]) if entry.get("link")))
+    story["original_titles"] = list(dict.fromkeys(normalize_title(entry["title"]) for i in story["ids"]
+                                                 for entry in item_evidence(items[i])))
     for link in story["links"]:
         if deadline is not None and time.monotonic() >= deadline:
             break
@@ -573,20 +866,28 @@ def enrich_story(story, items, settings, deadline=None):
     direct = [l for l in story["links"] if not is_google_news(l["url"]) and not is_tldr_issue(l["url"])]
     story["url"] = (direct or story["links"])[0]["url"]
 
-    article, og_image = None, ""
+    article, og_image, article_reason = None, "", None
+    last_reason = None
     for link in direct[:2]:
         if deadline is not None and time.monotonic() >= deadline:
             break
         try:
             text, og_image = fetch_article(link["url"], settings, deadline)
+        except ArticleAccessError as e:
+            last_reason = getattr(e, "reason", "insufficient_text")
+            log.warning("article access blocked for %s (%s)", link["url"], last_reason)
+            continue
         except Exception as e:
             log.warning("article fetch failed for %s (%s)", link["url"], type(e).__name__)
             continue
-        if len(text) >= 300:
+        if text and " ".join(text.split()):
             article = {"source": link["source"], "url": link["url"], "text": text}
             story["url"] = link["url"]
+            article_reason = None
             break
+        last_reason = "insufficient_text"
     story["article"] = article
+    story["article_reason"] = article_reason if article is not None else (last_reason or "insufficient_text")
 
     candidates = list(dict.fromkeys(e["image"] for i in story["ids"] for e in item_evidence(items[i]) if e["image"])) + [og_image]
     story["image"] = ""
@@ -610,7 +911,8 @@ def build_summary_prompt(stories, items):
         if story["article"]:
             lines.append(f"ARTICLE TEXT ({story['article']['source']}):\n{story['article']['text']}")
         else:
-            lines.append("ARTICLE TEXT: unavailable (use only the original feed evidence above)")
+            reason = story.get("article_reason") or "insufficient_text"
+            lines.append(f"ARTICLE TEXT: unavailable ({reason}; use only the original feed evidence above)")
         blocks.append("\n".join(lines))
     return SUMMARY_PROMPT.format(stories="\n\n".join(blocks))
 
@@ -631,8 +933,15 @@ def parse_summaries(content, n_stories):
             summaries[n] = {"headline": headline.strip(), "summary": summary.strip()}
     if not summaries:
         raise ValueError("model returned no usable rewrites")
+    subject = data.get("subject")
+    cleaned_subject = None
+    if isinstance(subject, str) and all(ch.isprintable() for ch in subject):
+        cleaned_subject = " ".join(subject.split())
+        cleaned_subject = "".join(ch for ch in cleaned_subject if ch.isprintable() and ch not in "\r\n")
+    if cleaned_subject and len(cleaned_subject) > 110:
+        cleaned_subject = None
     tldr = data.get("tldr")
-    return {"stories": summaries, "tldr": tldr.strip() if isinstance(tldr, str) else ""}
+    return {"stories": summaries, "tldr": tldr.strip() if isinstance(tldr, str) else "", "subject": cleaned_subject}
 
 
 def write_checkpoint(path, digest):
@@ -699,6 +1008,8 @@ def apply_rewrites(digest, summaries):
         story.update(summaries["stories"].get(n, {}))
     if len(summaries["stories"]) == len(stories) and summaries["tldr"]:
         final["tldr"] = summaries["tldr"]
+    if len(summaries["stories"]) == len(stories) and summaries.get("subject"):
+        final["subject"] = summaries["subject"]
     final["quality"] = "full" if len(summaries["stories"]) == len(stories) else "partial_pass_2"
     return final
 
@@ -865,12 +1176,19 @@ def render_html(digest, title, heading, date_label):
 
 
 def build_subject(digest, fallback):
-    """Tease up to three lead topics using the digest's editorial order."""
+    """Prefer the AI-written subject when it is grounded and valid; otherwise use the deterministic fallback."""
+    subject = digest.get("subject") if isinstance(digest, dict) else None
+    if isinstance(subject, str) and all(ch.isprintable() for ch in subject):
+        cleaned = " ".join(subject.split())
+        cleaned = "".join(ch for ch in cleaned if ch.isprintable() and ch not in "\r\n")
+        if cleaned and 1 <= len(cleaned) <= 110:
+            return cleaned
+
     headlines = []
     seen = set()
-    for section in digest["sections"]:
-        for story in section["stories"]:
-            headline = " ".join(story["headline"].split()).rstrip(" .!?")
+    for section in digest.get("sections", []):
+        for story in section.get("stories", []):
+            headline = " ".join(story.get("headline", "").split()).rstrip(" .!?")
             key = headline.casefold()
             if headline and key not in seen:
                 headlines.append(headline)
@@ -913,12 +1231,128 @@ def render_text(digest, title):
     return "\n".join(lines)
 
 
-def send_email(subject, text_body, html_body, email_config):
+def stable_edition_id(digest_date, subject, recipient=None, mode="scheduled"):
+    """Stable identifier for an edition; manual sends use a different namespace to avoid suppressing the scheduled edition."""
+    seed = "|".join(str(part) for part in [digest_date, mode, subject or "", recipient or os.environ.get("EMAIL_TO") or "", "digest-v1"])
+    return f"digest-{digest_date}-{mode}-{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:12]}"
+
+
+def prepared_edition_path(settings=None, path=None):
+    if path is not None:
+        target = Path(path)
+        return target if target.is_absolute() else (Path(__file__).resolve().parent / target)
+    env_path = os.environ.get("DIGEST_PREPARED_PATH") or os.environ.get("EMAIL_PREPARED_PATH")
+    if env_path:
+        target = Path(env_path)
+        return target if target.is_absolute() else (Path(__file__).resolve().parent / target)
+    settings = settings or load_config()["settings"]
+    for key in ("prepared_edition_path", "delivery_state_path", "digest_state_path"):
+        value = settings.get(key)
+        if value:
+            target = Path(value)
+            return target if target.is_absolute() else (Path(__file__).resolve().parent / target)
+    return None
+
+
+def atomic_json_write(path, payload):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_suffix(target.suffix + ".tmp")
+    temp.write_text(json.dumps(payload, default=str, indent=2), encoding="utf-8")
+    os.replace(temp, target)
+
+
+def load_prepared_edition(settings=None, path=None, digest_date=None, mode=None, subject=None, recipient=None):
+    target = prepared_edition_path(settings=settings, path=path)
+    if target is None or not target.exists():
+        return None
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        raise ValueError(f"prepared edition is unreadable at {target}; review delivery state before retrying")
+    if not isinstance(payload, dict):
+        raise ValueError("prepared edition must be an object")
+    if digest_date is not None and payload.get("digest_date") != digest_date:
+        return None
+    if mode is not None and payload.get("mode") != mode:
+        return None
+    if subject is not None and payload.get("subject") != subject:
+        return None
+    if recipient is not None and payload.get("recipient") != recipient:
+        return None
+    required = ("edition_id", "message_id", "subject", "recipient", "from_name", "to_name", "text_body", "html_body")
+    if any(not isinstance(payload.get(key), str) or not payload[key] for key in required):
+        raise ValueError("prepared edition is incomplete; review delivery state before retrying")
+    if payload.get("delivery_status") not in {"prepared", "failed", "sending", "unknown", "smtp_accepted"}:
+        raise ValueError("prepared edition has an unsupported delivery status")
+    return payload
+
+
+def should_retry_prepared_edition(record, digest_date, mode, subject=None, recipient=None):
+    if not isinstance(record, dict):
+        return True
+    if digest_date is not None and record.get("digest_date") != digest_date:
+        return True
+    if mode is not None and record.get("mode") != mode:
+        return True
+    if subject is not None and record.get("subject") != subject:
+        return True
+    if recipient is not None and record.get("recipient") != recipient:
+        return True
+    status = record.get("delivery_status")
+    if status in (None, "prepared", "failed"):
+        return True
+    return False
+
+
+def build_delivery_metadata(digest_date, subject, email_config, mode="scheduled"):
+    """Create safe metadata for the current transport; inbox delivery remains unknown unless a provider exposes it."""
+    recipient = os.environ.get("EMAIL_TO") or email_config.get("to_name") or "unknown"
+    namespace = mode
+    if mode == "manual":
+        namespace = f"manual-{os.environ.get("GITHUB_RUN_ID") or make_msgid()}"
+    return {
+        "digest_date": digest_date,
+        "subject": subject,
+        "recipient": recipient,
+        "from_name": email_config.get("from_name") or "AI Digest",
+        "to_name": email_config.get("to_name") or recipient,
+        "mode": mode,
+        "edition_id": stable_edition_id(digest_date, subject, recipient, mode=namespace),
+        "message_id": make_msgid(domain=(os.environ.get("SMTP_HOST") or "smtp.local").split(":", 1)[0] or "smtp.local"),
+        "prepared_at": datetime.now(timezone.utc).isoformat(),
+        "sender": os.environ.get("EMAIL_FROM") or os.environ.get("SMTP_USER"),
+        "delivery_status": "prepared",
+        "delivery_evidence": "draft_ready",
+        "inbox_delivery": "unknown",
+    }
+
+
+def persist_prepared_edition(record, settings=None, path=None):
+    target = prepared_edition_path(settings=settings, path=path)
+    if target is None:
+        return record
+    payload = dict(record)
+    payload.setdefault("delivery_status", "prepared")
+    payload.setdefault("delivery_evidence", "draft_ready")
+    payload.setdefault("inbox_delivery", "unknown")
+    atomic_json_write(target, payload)
+    return payload
+
+
+def send_email(subject, text_body, html_body, email_config, digest_date=None, delivery=None):
     user = os.environ["SMTP_USER"]
+    digest_date = digest_date or datetime.now(timezone.utc).date().isoformat()
+    delivery = delivery or build_delivery_metadata(digest_date, subject, email_config)
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = formataddr((email_config["from_name"], os.environ.get("EMAIL_FROM") or user))
-    msg["To"] = formataddr((email_config["to_name"], os.environ["EMAIL_TO"]))
+    msg["From"] = formataddr((delivery.get("from_name") or email_config["from_name"], delivery.get("sender") or os.environ.get("EMAIL_FROM") or user))
+    msg["To"] = formataddr((delivery.get("to_name") or email_config["to_name"], delivery.get("recipient") or os.environ["EMAIL_TO"]))
+    msg["Date"] = format_datetime(datetime.fromisoformat(delivery.get("prepared_at") or datetime.now(timezone.utc).isoformat()))
+    msg["Message-ID"] = delivery["message_id"]
+    msg["X-Digest-Edition"] = delivery["edition_id"]
+    msg["X-Digest-Delivery-Evidence"] = "smtp_server_acceptance"
+    msg["X-Digest-Inbox-Delivery"] = "unknown"
     msg.set_content(text_body)
     msg.add_alternative(html_body, subtype="html")
 
@@ -926,15 +1360,89 @@ def send_email(subject, text_body, html_body, email_config):
     with smtplib.SMTP(os.environ["SMTP_HOST"], port, timeout=30) as smtp:
         smtp.starttls(context=ssl.create_default_context())
         smtp.login(user, os.environ["SMTP_PASSWORD"])
+        delivery["delivery_status"] = "sending"
+        persist_prepared_edition(delivery, path=delivery.get("state_path"))
         smtp.send_message(msg)
+    delivery["delivery_status"] = "smtp_accepted"
+    delivery["delivery_evidence"] = "smtp_server_acceptance"
+    delivery["inbox_delivery"] = "unknown"
+    delivery["sent_at"] = datetime.now(timezone.utc).isoformat()
+    return delivery
 
 
-def record_outcome(outcome, digest_date):
+def deliver_prepared(delivery, settings, stats, path=None):
+    """Deliver a persisted edition, recovering accepted sends without regenerating content."""
+    digest_date = delivery["digest_date"]
+    status = delivery.get("delivery_status")
+    stats.update(delivery.get("stats", {}))
+    current_attempt = f"{os.environ.get("GITHUB_RUN_ID", "")}/{os.environ.get("GITHUB_RUN_ATTEMPT", "1")}"
+    owned_reservation = (status == "sending" and bool(os.environ.get("GITHUB_RUN_ID"))
+                         and delivery.get("attempt_id") == current_attempt)
+    if status in ("sending", "unknown") and not owned_reservation:
+        log.error("previous SMTP outcome is ambiguous; review edition %s before retrying", delivery["edition_id"])
+        stats.update(outcome="failed", delivery_status="unknown", delivery_evidence="ambiguous_smtp_result", inbox_delivery="unknown")
+        record_outcome("failed", digest_date, delivery_status="unknown")
+        raise SystemExit(1)
+    if status != "smtp_accepted":
+        delivery["state_path"] = str(path) if path else None
+        try:
+            send_email(delivery["subject"], delivery["text_body"], delivery["html_body"],
+                       {"from_name": delivery["from_name"], "to_name": delivery["to_name"]},
+                       digest_date=digest_date, delivery=delivery)
+        except Exception as error:
+            rejected = isinstance(error, (smtplib.SMTPAuthenticationError, smtplib.SMTPSenderRefused,
+                                         smtplib.SMTPRecipientsRefused, smtplib.SMTPDataError))
+            ambiguous = delivery.get("delivery_status") == "sending" and not rejected
+            delivery.update(delivery_status="unknown" if ambiguous else "failed",
+                            delivery_evidence="ambiguous_smtp_result" if ambiguous else "smtp_rejected_or_unavailable")
+            persist_prepared_edition(delivery, settings=settings, path=path)
+            stats.update(outcome="failed", delivery_status=delivery["delivery_status"],
+                         delivery_evidence=delivery["delivery_evidence"], inbox_delivery="unknown")
+            record_outcome("failed", digest_date, delivery_status=delivery["delivery_status"])
+            log.error("sending email failed (%s)", type(error).__name__)
+            raise SystemExit(1)
+        # send_email normally sets these fields. Keep compatibility with simple SMTP mocks.
+        delivery.update(delivery_status="smtp_accepted", delivery_evidence="smtp_server_acceptance", inbox_delivery="unknown")
+        delivery.setdefault("sent_at", datetime.now(timezone.utc).isoformat())
+        # Emit the receipt before optional history/metadata writes can fail.
+        record_outcome("sent", digest_date, delivery_status="smtp_accepted", edition_id=delivery["edition_id"],
+                       message_id=delivery["message_id"], sent_at=delivery["sent_at"], quality=delivery.get("quality", "unknown"))
+        stats.update(outcome="sent", delivery_status="smtp_accepted", delivery_evidence="smtp_server_acceptance", inbox_delivery="unknown")
+        persist_prepared_edition(delivery, settings=settings, path=path)
+    else:
+        record_outcome("sent", digest_date, delivery_status="smtp_accepted", edition_id=delivery["edition_id"],
+                       message_id=delivery["message_id"], quality=delivery.get("quality", "unknown"))
+    stats.update(outcome="sent", delivery_status="smtp_accepted", delivery_evidence="smtp_server_acceptance", inbox_delivery="unknown")
+    # Idempotent history repair also runs when recovering an already accepted edition.
+    if delivery.get("story_records"):
+        history = load_story_history(settings=settings)
+        existing = {(entry.get("edition"), tuple(entry.get("urls", []))) for entry in history}
+        history.extend(entry for entry in delivery["story_records"]
+                       if (entry.get("edition"), tuple(entry.get("urls", []))) not in existing)
+        history.sort(key=lambda entry: parse_history_date(entry.get("edition")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        save_story_history(history, settings=settings)
+    quality_path = os.environ.get("DIGEST_QUALITY_PATH") or settings.get("quality_history_path")
+    if quality_path:
+        history_path = Path(quality_path)
+        history = json.loads(history_path.read_text()) if history_path.exists() else []
+        history = [entry for entry in history if entry.get("edition_id") != delivery["edition_id"]]
+        history.insert(0, {"edition_id": delivery["edition_id"], "digest_date": digest_date,
+                           "quality": delivery.get("quality", "unknown"), "mode": delivery["mode"]})
+        atomic_json_write(history_path, history[:30])
+    log.info("SMTP accepted edition %s", delivery["edition_id"])
+
+
+def record_outcome(outcome, digest_date, **metadata):
     """Expose delivery status to Actions without including message contents or secrets."""
     output = os.environ.get("GITHUB_OUTPUT")
+    safe_metadata = {k: v for k, v in metadata.items() if v is not None}
     if output:
         with open(output, "a") as handle:
             handle.write(f"outcome={outcome}\ndigest_date={digest_date}\n")
+            for key, value in safe_metadata.items():
+                if isinstance(value, (dict, list, tuple)):
+                    value = json.dumps(value, default=str, separators=(",", ":"))
+                handle.write(f"{key}={value}\n")
 
 
 def write_run_summary(stats):
@@ -944,7 +1452,9 @@ def write_run_summary(stats):
     labels = {"feeds_succeeded": "Feeds succeeded", "feeds_total": "Feeds configured",
               "candidates": "Candidates after grouping", "selected": "Selected stories",
               "articles": "Articles retrieved", "llm_attempts": "LLM attempts",
-              "quality": "Summary level", "deadline_hit": "Deadline reached", "outcome": "Send outcome"}
+              "quality": "Summary level", "deadline_hit": "Deadline reached",
+              "outcome": "Send outcome", "delivery_status": "Delivery status",
+              "delivery_evidence": "Delivery evidence", "inbox_delivery": "Inbox delivery"}
     try:
         with open(path, "a") as handle:
             handle.write("## Digest run\n\n" + "\n".join(f"- {label}: {stats.get(key, 'unknown')}" for key, label in labels.items()) + "\n")
@@ -997,7 +1507,14 @@ def main():
     parser.add_argument("--save-replay", metavar="FILE", help="save inputs and successful model replies for offline replay")
     parser.add_argument("--replay", metavar="FILE", help="reparse and render a saved snapshot without network or email")
     parser.add_argument("--output", default="digest.html", help="HTML output path for dry runs and replay")
+    parser.add_argument("--history-path", metavar="FILE", help="JSON file for accepted story history")
+    parser.add_argument("--history-hours", type=int, help="override the accepted-story history retention window in hours")
+    parser.add_argument("--prepared-path", metavar="FILE", help="JSON file for prepared digest editions before SMTP send")
+    parser.add_argument("--prepare-only", action="store_true", help="persist the edition without sending")
+    parser.add_argument("--send-prepared", action="store_true", help="send/recover a saved edition without fetching or AI calls")
     args = parser.parse_args()
+    if sum((args.dry_run, args.replay is not None, args.prepare_only, args.send_prepared)) > 1:
+        parser.error("choose only one of --dry-run, --replay, --prepare-only, --send-prepared")
     if args.replay:
         if args.save_replay:
             parser.error("--replay and --save-replay cannot be combined")
@@ -1007,18 +1524,46 @@ def main():
     load_dotenv()
     config = load_config()
     settings = config["settings"]
+    if args.history_path:
+        settings["story_history_path"] = args.history_path
+    if args.history_hours is not None:
+        settings["story_history_hours"] = args.history_hours
+    if args.prepared_path:
+        settings["prepared_edition_path"] = args.prepared_path
     now = datetime.now(ZoneInfo(settings["timezone"]))
     digest_date = now.date().isoformat()
     record_outcome("failed", digest_date)
     stats = {"outcome": "failed", "feeds_total": len(config["feeds"]), "selected": 0,
              "articles": 0, "llm_attempts": 0, "quality": "none", "deadline_hit": False}
     try:
+        delivery_mode = "manual" if is_manual_run() else "scheduled"
+        recipient = os.environ.get("EMAIL_TO") or config["email"]["to_name"]
+        prepared_path = prepared_edition_path(settings=settings)
+        existing = (load_prepared_edition(settings=settings, digest_date=digest_date, mode=delivery_mode, recipient=recipient)
+                    if not args.dry_run else None)
+        if args.send_prepared and existing is None:
+            raise ValueError("no valid prepared edition for this date, mode and recipient")
+        if not args.dry_run and existing and (args.send_prepared or delivery_mode == "scheduled"):
+            if args.prepare_only:
+                stats.update(existing.get("stats", {}))
+                stats["outcome"] = "prepared"
+                if existing.get("delivery_status") in ("prepared", "failed") and os.environ.get("GITHUB_RUN_ID"):
+                    existing["delivery_status"] = "sending"
+                    existing["attempt_id"] = f"{os.environ["GITHUB_RUN_ID"]}/{os.environ.get("GITHUB_RUN_ATTEMPT", "1")}"
+                    persist_prepared_edition(existing, settings=settings, path=prepared_path)
+                record_outcome("prepared", digest_date)
+                return
+            deliver_prepared(existing, settings, stats, prepared_path)
+            return
         results = fetch_all(config)
         for name, items in results.items():
             log.info("%s: %d items", name, len(items))
 
         all_items = [item for items in results.values() for item in items]
         unique, dropped = dedupe(all_items)
+        history = load_story_history(path=args.history_path, settings=settings)
+        if not is_manual_run():
+            unique = apply_story_history_filter(unique, settings=settings, history=history, manual=False)
         log.info("dedupe: %d -> %d items", len(all_items), len(unique))
         stats.update(feeds_succeeded=len(results), candidates=len(unique))
         if not unique:
@@ -1054,18 +1599,27 @@ def main():
             out = Path(args.output)
             out.write_text(html_body)
             stats["outcome"] = "dry_run"
-            record_outcome("dry_run", digest_date)
+            stats["delivery_status"] = "unknown"
+            stats["delivery_evidence"] = "no_smtp_attempt"
+            stats["inbox_delivery"] = "unknown"
+            record_outcome("dry_run", digest_date, delivery_status="unknown", delivery_evidence="no_smtp_attempt", inbox_delivery="unknown")
             print(text_body)
             log.info("dry run: saved %s (subject: %s)", out, subject)
         else:
-            try:
-                send_email(subject, text_body, html_body, email_config)
-            except Exception as e:
-                log.error("sending email failed: %s", e)
-                raise SystemExit(1)
-            record_outcome("sent", digest_date)
-            stats["outcome"] = "sent"
-            log.info("sent: %s", subject)
+            delivery = build_delivery_metadata(digest_date, subject, email_config, mode=delivery_mode)
+            delivery.update(text_body=text_body, html_body=html_body, quality=digest.get("quality", "pass_1"),
+                            stats=dict(stats), story_records=accepted_story_history_for(digest, digest_date))
+            if args.prepare_only and os.environ.get("GITHUB_RUN_ID"):
+                delivery["delivery_status"] = "sending"
+                delivery["attempt_id"] = f"{os.environ["GITHUB_RUN_ID"]}/{os.environ.get("GITHUB_RUN_ATTEMPT", "1")}"
+            persist_prepared_edition(delivery, settings=settings, path=prepared_path)
+            if args.prepare_only:
+                if prepared_path is None:
+                    raise ValueError("--prepare-only requires a prepared state path")
+                stats["outcome"] = "prepared"
+                record_outcome("prepared", digest_date)
+                return
+            deliver_prepared(delivery, settings, stats, prepared_path)
     finally:
         write_run_summary(stats)
 
