@@ -29,6 +29,12 @@ jobs:
   digest:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TRIGGER: ${{ inputs.trigger }}
+      DIGEST_HISTORY_PATH: .digest-state/history.json
+      DIGEST_PREPARED_PATH: .digest-state/prepared.json
+      DIGEST_QUALITY_PATH: .digest-state/quality.json
     steps:
       - uses: actions/checkout@v7
 
@@ -52,10 +58,14 @@ jobs:
         if: steps.guard.outputs.skip != 'true'
         run: pip install -r requirements.txt
 
-      - name: Build and send digest
-        id: build
+      - name: Restore digest state
         if: steps.guard.outputs.skip != 'true'
-        run: python digest.py
+        run: python restore_state.py
+
+      - name: Prepare digest
+        id: prepare
+        if: steps.guard.outputs.skip != 'true'
+        run: python digest.py --prepare-only
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -65,9 +75,41 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
 
+      # Persist the reserved edition before SMTP. Another attempt treats an unfinished
+      # reservation as ambiguous instead of sending a potentially duplicate edition.
+      - uses: actions/upload-artifact@v4
+        if: steps.prepare.outputs.outcome == 'prepared'
+        with:
+          name: digest-state-prepared-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .digest-state/*.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Send prepared digest
+        id: build
+        if: steps.prepare.outputs.outcome == 'prepared'
+        run: python digest.py --send-prepared
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.prepare.outputs.outcome == 'prepared'
+        with:
+          name: digest-state-final-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .digest-state/*.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
       # A successful named step is the durable receipt read by later runs' window check.
       - name: "SMTP accepted: ${{ steps.build.outputs.digest_date }}"
-        if: steps.build.outputs.outcome == 'sent'
+        if: always() && steps.build.outputs.outcome == 'sent'
         run: echo "SMTP accepted the digest. This does not prove inbox delivery."
 
       - name: Email failure alert

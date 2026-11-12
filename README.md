@@ -25,6 +25,14 @@ Everything lives in `digest.py`; `main()` runs these steps in order.
 
 Grouping includes transitive URL/title matches and preserves original evidence. Distinct publishers are counted once even when also found through Google News. This only catches *exact* duplicates. The same story covered by two outlets with different headlines gets through dedupe, and the LLM merges it in pass 1. The prompt treats a story covered by several sources as a strong signal of importance: it ranks higher and lists every source. It also prioritizes major model releases, big company and lab news, funding and policy over minor product updates.
 
+### Cross-day story history
+
+Scheduled GitHub runs restore accepted story history from the latest non-expired `digest-state-*` artifact for their branch. The workflow sets `DIGEST_HISTORY_PATH` to `.digest-state/history.json`. Local runs can set that variable or `settings.story_history_path` explicitly, otherwise local history stays disabled. API or archive failures stop restoration visibly rather than silently discarding saved delivery state. Each accepted story record stores the edition date, normalized original/resolved URLs, original and generated titles, and source evidence. Grouped alternate links also participate in matching. The history is retained for `settings.story_history_hours` (default 72) and capped by `settings.story_history_max_entries` (default 500); stale or malformed entries are ignored during restore.
+
+The history filter runs only for scheduled runs. Manual runs (`workflow_dispatch` with `trigger=manual`) keep their ability to send immediately even if a recent digest already covered the same item. Dry runs, replayed snapshots, failed sends, and discarded candidates never advance the accepted-history file. Writes are atomic (`.tmp` + `os.replace`) so a crash does not leave a half-written JSON file.
+
+The guard is intentionally conservative: it suppresses only exact normalized URL matches or exact normalized title matches within the retention window. It does not do broad keyword matching, and it never fills a quiet day by reintroducing old stories. The remaining candidate list is used for both the AI-selection pass and the raw-headlines fallback, so the history rule is consistent across edition styles.
+
 ### The ID-mapping design (why links can't be invented)
 
 Each item goes into the prompt as `[id] (source) title` plus a snippet. The model is told to return only item **IDs**, never URLs:
@@ -49,7 +57,7 @@ After pass 1, `enrich_story` prepares each story:
 
 - **Google News links** (`news.google.com/rss/articles/…`) don't redirect with a plain GET. `decode_google_news` reads the article's signature from Google's page and asks Google's `batchexecute` endpoint for the real URL, the same way the Google News web app does. If that fails, the story uses a direct link from another source that covered it; a Google News link is only used as a last resort.
 - **Which article is read:** the first direct link (not Google News, not a TLDR issue page); if it fails or has under 300 characters of text, the next one. At most two tries per story.
-- **Paywalls and errors:** the story is marked "article unavailable" and pass 2 writes a shorter summary from the headline and feed snippets only.
+- **Paywalls and errors:** `fetch_article` treats clear login-page, subscription-wall, and bot-check signals as `login_required`, `paywall`, or `bot_challenge` instead of trusting a short extraction. A valid public article that mentions a paywall still stays in the digest; when no usable article text is available, the story is marked as unavailable and pass 2 writes a shorter summary from the headline and feed snippets only.
 
 Pass 2 sends all stories in **one** request containing original feed titles, snippets and article text. Generated pass-1 headlines are omitted from the evidence. Both prompts tell the model to treat source content as data and ignore embedded instructions. The prompt says to use only facts from that text, never names, numbers, dates, quotes or background from the model's own knowledge, and to leave out "why it matters" rather than guess. The model returns final headlines and summaries plus a final TL;DR. Missing or invalid rewrites keep their pass-1 fields. The final TL;DR replaces the first one only when every story has a valid rewrite. Prompt instructions reduce risk but do not prove factual accuracy.
 
@@ -64,6 +72,14 @@ Pass 2 sends all stories in **one** request containing original feed titles, sni
 | Gemini error (503, 429, timeout, bad JSON, zero usable stories) | Runs the LLM fallback chain below. If every step fails, the email is sent anyway as a **raw-headlines fallback**: every item grouped by source, under a yellow note saying "The AI summary failed today…". | 0 |
 | Pass 2 fails (all attempts) or articles can't be fetched | Logs `paragraph summaries failed, using short summaries`; the email uses pass 1's 1–2 sentence summaries, with resolved links and images. | 0 |
 | Sending the email fails (bad login, SMTP down) | Logs `sending email failed: …` and exits non-zero so the GitHub run shows **red**. The SMTP connection has a 30s timeout. | 1 |
+
+### Delivery observability and provider migration
+
+`send_email` now emits a stable `X-Digest-Edition` header and a standards-compliant `Message-ID` before the SMTP send, then records only the safe metadata in GitHub Actions output: edition ID, message ID, send timestamp, and the current evidence label. The code distinguishes between “prepared,” “SMTP accepted,” “failed,” and “unknown” downstream inbox states. With the current iCloud SMTP transport, the only evidence is SMTP server acceptance; it does not confirm that the recipient inbox received or read the message. The run still works with the existing `SMTP accepted: YYYY-MM-DD` receipt markers in `send_window.py`, and those markers are intentionally used to suppress duplicate sends without claiming final inbox delivery.
+
+The workflow prepares the edition with `--prepare-only`, uploads a state artifact, then uses `--send-prepared` for delivery. A final artifact saves the accepted/failed state and bounded story and quality histories. State artifacts expire after seven days. On retry, the script checks saved state before fetching feeds or calling Gemini, preserving the prepared subject, bodies, sender, recipient, Date, and Message-ID. Deliberate manual runs have separate edition IDs and bypass story-history filtering. Existing send-window receipt rules still apply, including the early-manual-run exception. If the persisted record was already accepted by the SMTP server, the retry path will skip the resend rather than risk a duplicate send; an explicitly rejected or safely prepared record can retry its saved content. Before uploading a pre-send artifact, the workflow reserves it to that run attempt. A later attempt encountering an unfinished reservation or ambiguous SMTP result stops for review instead of automatically resending. This conservative policy can defer an edition that never reached SMTP if the runner dies after reservation. This is not exactly-once delivery: SMTP acceptance, a Message-ID, or GitHub receipts only prove the transport accepted a request, not that the provider deduplicated or that the inbox ultimately delivered it.
+
+When a provider-specific mail backend is chosen later, the same persisted record can carry a provider idempotency key, a retention window, and a payload-hash check to guard retries of the exact same request. That extension remains intentionally deferred until sender migration is authorized. The stored payload is kept minimal and safe, and mismatches are treated as a retry boundary rather than silently mutated state.
 
 **LLM fallback chain** (`run_llm_chain`, used by both passes, all values in `config.yaml`):
 
@@ -106,6 +122,7 @@ The email follows `design/Apple_News_reference.jpeg`: a compact morning briefing
 | `requirements.txt` | Pinned dependencies: `feedparser`, `openai`, `python-dotenv`, `PyYAML`, `requests`, `trafilatura` (article text extraction). |
 | `design/` | `Apple_News_reference.jpeg`, the current visual reference; `reference.png` is the older reference. Not used at runtime. |
 | `.github/workflows/daily-digest.yml` | The GitHub Actions workflow: `workflow_dispatch` trigger input (for cron-job.org), backup UTC crons, send-window check, Python setup, secrets → env vars, runs `python digest.py`, emails you if a run fails. |
+| `restore_state.py` | Restores validated JSON state files from the newest branch-specific GitHub artifact. Uses the preinstalled `gh` CLI and standard library. |
 | `send_window.py` | Decides whether a scheduled run (GitHub cron or `trigger=external-schedule`) sends: inside 7:45–10:00 AM Chicago and nothing sent yet today. Standard library only. |
 | `prompts/` | The step-by-step build prompts used to create this project with Claude Code (`prompt_0_brief.md` … `prompt_11_redesign.md`). History only; nothing reads them at runtime. |
 | `.gitignore` | Standard Python template plus `.env`, `.venv` and `.claude/` (local Claude Code settings, not tracked). Keeps secrets and the virtualenv out of git; `__pycache__/` is ignored too. |
@@ -134,9 +151,21 @@ On a normal day, the 7:50 external run sends and every GitHub cron firing skips.
 
 Run and job listings are paginated. If the GitHub API call fails, the step fails instead of risking a duplicate, and the failure alert below fires. Concurrency serializes runs, so a run that starts while another is in progress waits for it, then sees its receipt. The script exposes `sent`, `no_items`, `failed`, or `dry_run` through Actions outputs.
 
-SMTP acceptance does not prove inbox delivery. A runner crash between SMTP acceptance and recording the receipt can still cause a duplicate on the next firing. SMTP offers no atomic transaction with GitHub's run metadata.
+SMTP acceptance does not prove inbox delivery. Reserved pre-send state reduces duplicate risk across runner crashes by holding ambiguous editions for review. SMTP offers no atomic transaction with GitHub run metadata. If state artifacts expire or are deleted, the next run starts without that history, and exactly-once delivery cannot be guaranteed.
 
 **Failure alert:** if any step fails, a final step emails you "AI Daily News Digest failed – check GitHub Actions" with a link to the run, using the same SMTP secrets. If the SMTP secrets themselves are broken, only GitHub's own failure notification reaches you. cron-job.org separately emails you if its call to GitHub fails (for example, an expired token).
+
+### Inactive monitor design for missed digest and degraded runs
+
+The repo includes an inactive monitoring design for the cases the current workflow does not actively watch: a missing edition after the 10:00 AM Chicago cutoff, and repeated degraded editions such as a raw-headline fallback or partial-summary pass. The settings in `config.yaml` are intentionally off by default:
+
+- `settings.digest_monitor_enabled: false`
+- `settings.digest_monitor_quality_threshold: 2`
+- `settings.digest_monitor_notification_channel: "disabled"`
+
+The monitoring logic lives in [`send_window.py`](send_window.py) and provides stable alert IDs and a deduplication helper for a future monitor. An activated monitor must persist its seen-alert IDs. Accepted edition quality is saved in `.digest-state/quality.json` (up to 30 entries) for later evaluation. It evaluates the expected daily receipt, checks workflow status for an in-flight run, and reports degraded-quality streaks. Pending runs are diagnostic state and do not produce actionable missing-digest alerts. It does not write or post anything until an external monitor is activated with reviewable credentials and an explicit destination.
+
+This is intentionally not enabled in production. A GitHub-only monitor cannot detect the case where GitHub itself never starts the scheduled workflow, and the current SMTP failure email uses the same transport as the digest itself. That dependency is explicit in the code and documentation so a separately authorized notification channel can be chosen later for transport failures. Activation still requires a real recipient, a real external trigger, and an approval step outside the repo.
 
 ### External trigger setup (cron-job.org)
 
@@ -444,3 +473,12 @@ Replay returns before loading `.env`, fetching feeds, constructing the API clien
 Snapshots contain source text, article excerpts, selected stories and successful model replies; they explicitly omit credentials and environment variables. Save personal snapshots outside the repository. For an immediate synthetic offline example, use `tests/fixtures/replay.json` as the replay input. These snapshots support parser/rendering development; they do not measure how a live model responds to edited prompts.
 
 Prompts 16–18 implement grounding, subprocess deadlines, and summaries/replay sequentially. Regression tests include malformed JSON, partial rewrites, article failures, deadline exhaustion, real sleeping subprocess termination, saved checkpoints, replay isolation, and delivery outcomes. No additional runtime dependencies were introduced.
+
+
+## State and recovery verification
+
+The workflow uses the existing read-only Actions permission to restore state and the artifact action to publish pre-send and final state. Archives contain recipient addresses and prepared email bodies, so treat them as private data. No SMTP passwords or API keys are stored. `.digest-state/` is ignored by Git. Restore selects the latest artifact by ID for the current branch, and validates expected JSON files without extracting arbitrary archive paths.
+
+For an ambiguous delivery, inspect the workflow logs, the latest `prepared.json` artifact, and the receiving mailbox before taking recovery action. A confirmed accepted record should remain `smtp_accepted`. Only mark an edition safely retryable after confirming it was not accepted. Reusing an accepted record can repair history and produce a receipt without resending. A corrupted prepared record blocks automatic sending and requires review. Never edit state to force a resend without checking the prior outcome.
+
+The regression suite includes mocked preparation, artifact restoration, SMTP acceptance, explicit rejection, connection loss during submission, restart without feed/AI calls, original source evidence matching, partial-subject fallbacks, and monitor in-flight status. Run `.venv/bin/python -m unittest discover -s tests -v`. Live SMTP, model availability and inbox delivery require separate verification. The inactive external monitor still needs a chosen independent trigger and notification channel before activation.
