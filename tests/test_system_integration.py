@@ -41,7 +41,12 @@ class PreparedWorkflowTests(unittest.TestCase):
 
     def prepare(self):
         with patch.object(digest, 'fetch_all', return_value={'Feed': [self.item]}), patch.object(digest, 'summarize', return_value=self.edition), patch.object(digest, 'send_email') as send:
-            self.run_main('--prepare-only')
+            password = os.environ.pop('SMTP_PASSWORD', None)
+            try:
+                self.run_main('--prepare-only')
+            finally:
+                if password is not None:
+                    os.environ['SMTP_PASSWORD'] = password
             send.assert_not_called()
 
     def test_prepare_send_and_accepted_retry_preserve_content_and_history(self):
