@@ -36,7 +36,7 @@ jobs:
       DIGEST_PREPARED_PATH: .digest-state/prepared.json
       DIGEST_QUALITY_PATH: .digest-state/quality.json
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # Scheduled runs (external or GitHub cron) send once, the first time one lands
       # between 7:45 and 10:00 AM Chicago. Plain manual runs always send.
@@ -48,7 +48,7 @@ jobs:
           TRIGGER: ${{ inputs.trigger }}
         run: python3 send_window.py
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         if: steps.guard.outputs.skip != 'true'
         with:
           python-version: "3.13"
@@ -71,13 +71,12 @@ jobs:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
 
       # Persist the reserved edition before SMTP. Another attempt treats an unfinished
       # reservation as ambiguous instead of sending a potentially duplicate edition.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: steps.prepare.outputs.outcome == 'prepared'
         with:
           name: digest-state-prepared-${{ github.run_id }}-${{ github.run_attempt }}
@@ -98,7 +97,7 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always() && steps.prepare.outputs.outcome == 'prepared'
         with:
           name: digest-state-final-${{ github.run_id }}-${{ github.run_attempt }}

@@ -155,7 +155,11 @@ SMTP acceptance does not prove inbox delivery. Reserved pre-send state reduces d
 
 **Failure alert:** if any step fails, a final step emails you "AI Daily News Digest failed – check GitHub Actions" with a link to the run, using the same SMTP secrets. If the SMTP secrets themselves are broken, only GitHub's own failure notification reaches you. cron-job.org separately emails you if its call to GitHub fails (for example, an expired token).
 
-### Inactive monitor design for missed digest and degraded runs
+### Independent missing-digest monitor
+
+The standalone [Google Apps Script monitor](monitoring/README.md) checks the private repository outside GitHub Actions and emails an alert for a missing SMTP receipt or failed verification. Its source and explicit permissions manifest are backed up under `monitoring/`; credentials stay in Google Script properties. Follow the guide to install or update the live Google project and maintain its token and trigger. Pushing this repository does not update that project automatically.
+
+### Inactive degraded-quality monitor design
 
 The repo includes an inactive monitoring design for the cases the current workflow does not actively watch: a missing edition after the 10:00 AM Chicago cutoff, and repeated degraded editions such as a raw-headline fallback or partial-summary pass. The settings in `config.yaml` are intentionally off by default:
 
@@ -165,7 +169,7 @@ The repo includes an inactive monitoring design for the cases the current workfl
 
 The monitoring logic lives in [`send_window.py`](send_window.py) and provides stable alert IDs and a deduplication helper for a future monitor. An activated monitor must persist its seen-alert IDs. Accepted edition quality is saved in `.digest-state/quality.json` (up to 30 entries) for later evaluation. It evaluates the expected daily receipt, checks workflow status for an in-flight run, and reports degraded-quality streaks. Pending runs are diagnostic state and do not produce actionable missing-digest alerts. It does not write or post anything until an external monitor is activated with reviewable credentials and an explicit destination.
 
-This is intentionally not enabled in production. A GitHub-only monitor cannot detect the case where GitHub itself never starts the scheduled workflow, and the current SMTP failure email uses the same transport as the digest itself. That dependency is explicit in the code and documentation so a separately authorized notification channel can be chosen later for transport failures. Activation still requires a real recipient, a real external trigger, and an approval step outside the repo.
+This Python monitoring helper is intentionally not enabled in production. The independent Google monitor above is configured separately. A GitHub-only monitor cannot detect the case where GitHub itself never starts the scheduled workflow, and the current SMTP failure email uses the same transport as the digest itself. That dependency is explicit in the code and documentation so a separately authorized notification channel can be chosen later for transport failures. Activating the Python helper would require its own persisted alert state, trigger, and notification destination.
 
 ### External trigger setup (cron-job.org)
 
@@ -481,4 +485,4 @@ The workflow uses the existing read-only Actions permission to restore state and
 
 For an ambiguous delivery, inspect the workflow logs, the latest `prepared.json` artifact, and the receiving mailbox before taking recovery action. A confirmed accepted record should remain `smtp_accepted`. Only mark an edition safely retryable after confirming it was not accepted. Reusing an accepted record can repair history and produce a receipt without resending. A corrupted prepared record blocks automatic sending and requires review. Never edit state to force a resend without checking the prior outcome.
 
-The regression suite includes mocked preparation, artifact restoration, SMTP acceptance, explicit rejection, connection loss during submission, restart without feed/AI calls, original source evidence matching, partial-subject fallbacks, and monitor in-flight status. Run `.venv/bin/python -m unittest discover -s tests -v`. Live SMTP, model availability and inbox delivery require separate verification. The inactive external monitor still needs a chosen independent trigger and notification channel before activation.
+The regression suite includes mocked preparation, artifact restoration, SMTP acceptance, explicit rejection, connection loss during submission, restart without feed/AI calls, original source evidence matching, partial-subject fallbacks, and monitor in-flight status. Run `.venv/bin/python -m unittest discover -s tests -v`. Live SMTP, model availability and inbox delivery require separate verification. The standalone Google monitor has separate installation and maintenance steps in [monitoring/README.md](monitoring/README.md); the degraded-quality monitoring helper remains inactive.
