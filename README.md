@@ -451,6 +451,8 @@ The repo is currently private. In a **public** repository, GitHub automatically 
 
 ## Offline regression checks
 
+The **Automated tests** workflow runs on every push and pull request, and can also be started from **Actions > Automated tests > Run workflow**. It runs the Python regression suite, seven mocked Google monitor scenarios, and monitor syntax/manifest checks. View the green check or failure details in the commit, pull request, or Actions tab. It uses no email or AI secrets and does not run the digest delivery workflow. Dependency installation needs network access; the tests use mocked services. Test runs have their own concurrency group, so they cannot cancel daily delivery. See [the workflow](.github/workflows/tests.yml) and [implementation prompt](prompts/prompt_29_automatic_testing.md).
+
 Run `.venv/bin/python -m unittest discover -s tests -v`. Tests cover delivery outcomes, the send window (CST, CDT, DST switch days, receipts, early manual runs, external trigger vs GitHub cron, manual always sends), duplicate evidence preservation, TLDR parsing and fallback, editorial validation, and short-selection retry behavior. SMTP and Gemini are mocked; tests do not send email or consume API quota. The TLDR parser was also checked against the public October 30, 2026 issue.
 
 Implementation prompts are in `prompts/prompt_12_track_email_delivery.md` through `prompts/prompt_15_validate_editorial_output.md`, executed sequentially with checks after each stage.
