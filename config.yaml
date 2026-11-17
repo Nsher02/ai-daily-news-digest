@@ -9,9 +9,9 @@ settings:
   min_stories: 10
   max_stories: 15
   llm_timeout: 60       # seconds per LLM request
-  llm_retries: 3        # retries of the primary model
-  llm_backoff: 2        # seconds; doubles each retry (2, 4, 8)
-  llm_final_wait: 300   # seconds before the last try of the primary model
+  llm_retries: 1        # primary retries after trying the backup model
+  llm_backoff: 2        # seconds before the primary retry; doubles if retries are increased
+  llm_final_wait: 15    # seconds before the final primary attempt
   llm_step_cap: 600     # hard cap on the whole LLM step, in seconds
   user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
   digest_monitor_enabled: false
