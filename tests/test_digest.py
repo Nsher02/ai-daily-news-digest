@@ -309,7 +309,7 @@ class EditorialTests(unittest.TestCase):
         settings = digest.load_config()['settings']
         response = Mock()
         response.choices = [Mock(message=Mock(content='unused'))]
-        for complete, expected_calls in [(True, 1), (False, 5)]:
+        for complete, expected_calls in [(True, 1), (False, 3)]:
             result = {'selection_complete': complete}
             with patch.object(digest, 'OpenAI') as client, patch.dict('os.environ', {'LLM_API_KEY': 'offline-test'}), patch.object(digest.time, 'sleep'):
                 request = client.return_value.chat.completions.create
@@ -317,6 +317,50 @@ class EditorialTests(unittest.TestCase):
                 returned = digest.run_llm_chain('prompt', lambda _: result, settings, time.monotonic() + 600, 'test', count=lambda _: 1, want=10, final_try=False, accept_short=lambda d: d['selection_complete'])
                 self.assertIs(returned, result)
                 self.assertEqual(request.call_count, expected_calls)
+
+
+class ModelFailoverTests(unittest.TestCase):
+    def run_chain(self, succeed_on=None, deadline=600):
+        settings = digest.load_config()['settings']
+        clock = [0.0]
+        calls, sleeps = [], []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+
+        def request(**kwargs):
+            calls.append((kwargs['model'], clock[0], kwargs['timeout']))
+            if len(calls) == succeed_on:
+                return Mock(choices=[Mock(message=Mock(content='ok'))])
+            clock[0] += kwargs['timeout']
+            raise TimeoutError('simulated provider timeout')
+
+        with patch.object(digest, 'OpenAI') as client, patch.dict('os.environ', {'LLM_API_KEY': 'offline', 'LLM_MODEL': 'primary', 'LLM_LITE_MODEL': 'backup'}), patch.object(digest.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(digest.time, 'sleep', side_effect=sleep):
+            client.return_value.chat.completions.create.side_effect = request
+            if succeed_on:
+                self.assertEqual(digest.run_llm_chain('prompt', lambda x: x, settings, deadline, 'test'), 'ok')
+            else:
+                with self.assertRaises(TimeoutError):
+                    digest.run_llm_chain('prompt', lambda x: x, settings, deadline, 'test')
+        return calls, sleeps, clock[0]
+
+    def test_backup_runs_immediately_after_first_primary_timeout(self):
+        calls, sleeps, _ = self.run_chain(succeed_on=2)
+        self.assertEqual(calls, [('primary', 0, 60), ('backup', 60, 60)])
+        self.assertEqual(sleeps, [])
+
+    def test_exhaustion_uses_short_cooldown_and_preserves_stage_budget(self):
+        calls, sleeps, elapsed = self.run_chain()
+        self.assertEqual([model for model, _, _ in calls], ['primary', 'backup', 'primary', 'primary'])
+        self.assertEqual(sleeps, [2, 15])
+        self.assertEqual(elapsed, 257)
+
+    def test_retries_respect_remaining_deadline(self):
+        calls, sleeps, elapsed = self.run_chain(deadline=130)
+        self.assertEqual(calls[-1], ('primary', 122, 8))
+        self.assertEqual(sleeps, [2])
+        self.assertEqual(elapsed, 130)
 
 
 class IntegrationTests(unittest.TestCase):
@@ -588,7 +632,7 @@ class StoryHistoryTests(unittest.TestCase):
             self.assertEqual(digest.load_story_history(path=path, settings=settings), [])
             digest.record_accepted_story_history({'sections': [{'stories': [{'headline': 'Beta launch',
                                                                            'links': [{'source': 'Publisher', 'url': 'https://example.com/beta'}]}]}]},
-                                                '2026-11-12', settings=settings, path=path)
+                                                datetime.now(timezone.utc).date().isoformat(), settings=settings, path=path)
             loaded = digest.load_story_history(path=path, settings=settings)
             self.assertTrue(any('https://example.com/beta' in entry['urls'] for entry in loaded))
 
