@@ -61,9 +61,11 @@ After pass 1, `enrich_story` prepares each story:
 
 Pass 2 sends all stories in **one** request containing original feed titles, snippets and article text. Generated pass-1 headlines are omitted from the evidence. Both prompts tell the model to treat source content as data and ignore embedded instructions. The prompt says to use only facts from that text, never names, numbers, dates, quotes or background from the model's own knowledge, and to leave out "why it matters" rather than guess. The model returns final headlines and summaries plus a final TL;DR. Missing or invalid rewrites keep their pass-1 fields. The final TL;DR replaces the first one only when every story has a valid rewrite. Prompt instructions reduce risk but do not prove factual accuracy.
 
-**Gemini usage:** a normal run makes **2 requests** (pass 1 + pass 2). Pass 2 uses the same retry chain minus the 5-minute final wait, because a pass-1 digest is already a good fallback.
+**Gemini usage:** a normal run makes **2 requests** (pass 1 + pass 2). Pass 2 uses the same retry chain without the final primary attempt and its cooldown, because a pass-1 digest is already a good fallback.
 
 ### Failure behavior
+
+Each AI pass tries the primary model once, then immediately tries the backup if the primary fails or returns an incomplete selection. With current settings, it then retries the primary after 2 seconds and, if needed, makes one final primary attempt after a 15-second cooldown. Each request has a 60-second timeout bounded by the remaining stage deadline. Four full request timeouts plus waits consume about 257 seconds rather than exhausting the 600-second stage on one pass. Permanent model errors still skip later attempts for that model, and usable partial results remain available as fallbacks.
 
 | Situation | What happens | Exit code |
 | --- | --- | --- |
@@ -222,9 +224,9 @@ The job runs on `ubuntu-latest` with Python 3.13, caches pip, and has a **20-min
 | `settings.min_stories` | `10` | Minimum stories in the email whenever enough items exist. |
 | `settings.max_stories` | `15` | Max stories the LLM is asked to pick. |
 | `settings.llm_timeout` | `60` | Seconds per Gemini request (per attempt). |
-| `settings.llm_retries` | `3` | Retries of the primary model. |
-| `settings.llm_backoff` | `2` | Seconds before the first retry; doubles each time (2, 4, 8). |
-| `settings.llm_final_wait` | `300` | Seconds to wait before the last try of the primary model (shortened if needed to fit the cap). |
+| `settings.llm_retries` | `1` | Primary retries after trying the backup model. |
+| `settings.llm_backoff` | `2` | Seconds before the primary retry; doubles if more retries are configured. |
+| `settings.llm_final_wait` | `15` | Seconds to wait before the last try of the primary model (shortened if needed to fit the cap). |
 | `settings.llm_step_cap` | `600` | Hard cap on the whole LLM step (both passes and article fetching), in seconds. |
 | `settings.user_agent` | browser UA string | Sent with feed requests; some sites block default Python agents. |
 | `email.subject_prefix` | `AI Daily News Digest` | Digest name used in the masthead and in the fallback subject when no headline is available. |

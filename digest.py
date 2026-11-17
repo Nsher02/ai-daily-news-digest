@@ -663,7 +663,7 @@ def describe_error(e):
 
 
 def run_llm_chain(prompt, parse, settings, deadline, label, final_try=True, count=None, want=0, accept_short=None, on_attempt=None, on_response=None):
-    """Primary model with retries, then the lite model once, then (optionally) the primary after a long wait.
+    """Try primary, then lite immediately, then bounded primary retries and a final cooldown.
 
     parse(content) turns the model's reply into a result or raises. If count(result) < want, the result
     is kept as a fallback unless accept_short confirms a fully accounted selection.
@@ -673,9 +673,8 @@ def run_llm_chain(prompt, parse, settings, deadline, label, final_try=True, coun
     primary = os.environ.get("LLM_MODEL") or DEFAULT_LLM_MODEL
     lite = os.environ.get("LLM_LITE_MODEL") or DEFAULT_LLM_LITE_MODEL
 
-    attempts = [(primary, 0)]
+    attempts = [(primary, 0), (lite, 0)]
     attempts += [(primary, settings["llm_backoff"] * 2**i) for i in range(settings["llm_retries"])]
-    attempts += [(lite, 0)]
     if final_try:
         attempts += [(primary, settings["llm_final_wait"])]
     dead_models, short, last_error = set(), None, None
@@ -685,7 +684,7 @@ def run_llm_chain(prompt, parse, settings, deadline, label, final_try=True, coun
         if model in dead_models or (final and short):
             continue
         if final:
-            # Shorten the long wait so the last attempt still gets a full timeout before the cap.
+            # Shorten the cooldown so the last attempt can fit within the stage cap.
             wait = min(wait, deadline - time.monotonic() - timeout)
         wait = min(wait, max(0, deadline - time.monotonic()))
         if wait > 0:
