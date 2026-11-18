@@ -345,6 +345,10 @@ Gemini and Groq use the same editorial prompt, grounding rules, ID/link validati
 
 Offline checks: `python -m unittest discover -s tests -v`. Local live verification requires `GROQ_API_KEY` and `LLM_API_KEY` in the environment; `python verify_groq.py` sends no email, while `python verify_groq.py --send-email` explicitly sends one labeled test after both stages pass. No additional SDK is required.
 
+## Making future changes
+
+Follow [CONTRIBUTING.md](CONTRIBUTING.md): use a `codex/` branch and pull request, then merge through `python3 scripts/merge_pr.py NUMBER` only after the current commit passes **Offline regression tests** and includes the latest `main`. The local pre-push hook blocks direct pushes to `main` when installed. Persistent agent instructions enforce this working convention; GitHub Free does not provide server-enforced branch protection for this private repository. No automatic merging or additional credentials are enabled.
+
 ## GitHub access and permissions
 
 The [GitHub access audit and manual token checklist](docs/github-access-audit.md) records the live repository settings and their limitations. Actions are restricted to the allowlisted action repositories with full SHA pins required. Checkouts do not persist credentials, and explicit workflow GitHub-token exposure is limited to send-window checking and state restoration. Dependabot alerts and weekly reviewable update PRs help maintain dependencies. The cron-job.org scheduler and Google monitor need separate, one-repository tokens with Actions write and Actions read access respectively; neither token belongs in the repository.
