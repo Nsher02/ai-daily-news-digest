@@ -121,3 +121,25 @@ class WorkerCheckpointTests(unittest.TestCase):
         replay = digest.parse_summaries(result['replay_responses']['pass2'],15)
         self.assertEqual(set(replay['stories']),set(range(1,7)))
         self.assertEqual(result['tldr'],'Initial edition brief')
+
+
+class SharedEditorialRulesTests(unittest.TestCase):
+    def test_rich_source_requires_same_full_paragraph_contract(self):
+        from verify_groq_batches import fixtures
+        _, stories = fixtures()
+        short = json.dumps({'stories':[{'n':1,'headline':'Original headline','summary':'A brief rewrite.'}]})
+        with self.assertRaises(ValueError):
+            digest.parse_story_summaries(short, stories[:1])
+        valid = json.dumps({'stories':[{'n':1,'headline':'Original headline','summary':PARAGRAPH}]})
+        self.assertEqual(digest.parse_story_summaries(valid, stories[:1])['stories'][1]['summary'], PARAGRAPH)
+
+    def test_sparse_source_does_not_force_padding(self):
+        stories = [{'article':None}]
+        raw = json.dumps({'stories':[{'n':1,'headline':'Original headline','summary':'A source-supported short summary.'}]})
+        self.assertEqual(len(digest.parse_story_summaries(raw, stories)['stories']),1)
+
+    def test_partial_result_cannot_replace_edition_subject_or_brief(self):
+        raw = json.dumps({'subject':'Incomplete scope','tldr':'Only one story','stories':[{'n':1,'headline':'Headline','summary':'Supported summary.'}]})
+        parsed = digest.parse_story_summaries(raw,[{'article':None},{'article':None}])
+        self.assertIsNone(parsed['subject'])
+        self.assertEqual(parsed['tldr'],'')
