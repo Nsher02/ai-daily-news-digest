@@ -1,0 +1,47 @@
+name: Verify Groq backup
+on:
+  workflow_dispatch:
+    inputs:
+      send_email:
+        description: Send one clearly labeled fictional test digest after verification
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: groq-verification
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Verify Groq without sending email
+        if: ${{ !inputs.send_email }}
+        run: python verify_groq.py
+        env:
+          LLM_API_KEY: unused-for-forced-failover
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: ${{ vars.GROQ_MODEL }}
+      - name: Verify Groq and send one test email
+        if: ${{ inputs.send_email }}
+        run: python verify_groq.py --send-email
+        env:
+          LLM_API_KEY: unused-for-forced-failover
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: ${{ vars.GROQ_MODEL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
