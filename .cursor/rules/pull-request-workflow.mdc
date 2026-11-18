@@ -1,0 +1,10 @@
+---
+description: Use tested pull requests for all changes to this private repository
+alwaysApply: true
+---
+
+Follow AGENTS.md and CONTRIBUTING.md for every repository change.
+Work on a codex/ branch, open a PR, and use scripts/merge_pr.py only after the
+current PR commit passes Offline regression tests and includes current main.
+Never push directly to main or bypass failed/missing checks.
+Do not merge unrelated PRs or send email without task authorization.
