@@ -1,7 +1,6 @@
 """Token-budgeted Groq calls and complete, resumable story rewriting."""
 import json
 import logging
-import re
 import time
 
 log = logging.getLogger(__name__)
@@ -85,7 +84,6 @@ def summarize_batches(client, model, stories, items, settings, deadline, budget,
             candidate = selected + [n]
             batch = [stories[i-1] for i in candidate]
             proposed = digest.build_summary_prompt(batch, items)
-            proposed += '\nReturn EVERY story in this batch; use local story numbers 1 through ' + str(len(batch)) + '. Write 4–6 sentences (about 90–160 words) when article evidence supports it. Never pad sparse evidence.'
             if budget.fits(proposed):
                 selected, prompt = candidate, proposed
             else:
@@ -95,7 +93,6 @@ def summarize_batches(client, model, stories, items, settings, deadline, budget,
             selected = [pending[0]]
             for cap in (3000, 1800, 900, 400):
                 prompt = digest.build_summary_prompt([stories[selected[0]-1]], items, evidence_chars=cap)
-                prompt += '\nReturn the one requested story. Use 4–6 sentences when supported by the source evidence.'
                 if budget.fits(prompt):
                     break
             if not budget.fits(prompt):
@@ -106,16 +103,8 @@ def summarize_batches(client, model, stories, items, settings, deadline, budget,
         for attempt in range(2):
             try:
                 raw = request_groq(client, model, prompt, settings, deadline, budget, on_attempt)
-                parsed = digest.parse_summaries(raw, len(batch))
-                added = {}
-                for local, rewrite in parsed['stories'].items():
-                    story = batch[local-1]
-                    article = story.get('article')
-                    rich = article and len(article.get('text', '')) >= 800
-                    summary = rewrite['summary']
-                    if rich and (len(summary.split()) < 90 or len(re.findall(r'[.!?](?:\s|$)', summary)) < 4):
-                        continue
-                    added[selected[local-1]] = rewrite
+                parsed = digest.parse_story_summaries(raw, batch)
+                added = {selected[local-1]: rewrite for local, rewrite in parsed['stories'].items()}
                 if not added:
                     raise ValueError('Groq returned no sufficiently complete paragraphs')
                 completed.update(added)
