@@ -7,6 +7,11 @@ import digest
 
 
 class GroqBackupTests(unittest.TestCase):
+    def setUp(self):
+        self.tokens = patch("groq_summary.GroqBudget.count_tokens", return_value=300)
+        self.tokens.start()
+        self.addCleanup(self.tokens.stop)
+
     def test_separate_clients_keys_and_compact_prompt(self):
         gemini, groq = Mock(), Mock()
         gemini.chat.completions.create.side_effect = TimeoutError('unavailable')
@@ -19,7 +24,7 @@ class GroqBackupTests(unittest.TestCase):
         self.assertEqual(factory.call_args_list[1].kwargs['base_url'], digest.GROQ_BASE_URL)
         request = groq.chat.completions.create.call_args.kwargs
         self.assertEqual(request['messages'][0]['content'], 'compact JSON prompt')
-        self.assertEqual(request['max_completion_tokens'], 3000)
+        self.assertEqual(request['max_completion_tokens'], 2600)
 
     def test_groq_failure_returns_to_gemini_with_bounded_wait(self):
         gemini, groq = Mock(), Mock()
