@@ -31,6 +31,7 @@ import yaml
 from dotenv import load_dotenv
 import openai
 from openai import OpenAI
+from groq_summary import GroqBudget, request_groq, summarize_batches
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
 LLM_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -667,7 +668,7 @@ def describe_error(e):
     return f"{type(e).__name__}: {e}"
 
 
-def run_llm_chain(prompt, parse, settings, deadline, label, final_try=True, count=None, want=0, accept_short=None, on_attempt=None, on_response=None, groq_prompt=None):
+def run_llm_chain(prompt, parse, settings, deadline, label, final_try=True, count=None, want=0, accept_short=None, on_attempt=None, on_response=None, groq_prompt=None, groq_budget=None, groq_runner=None):
     """Try primary, then lite immediately, then bounded primary retries and a final cooldown.
 
     parse(content) turns the model's reply into a result or raises. If count(result) < want, the result
@@ -682,7 +683,10 @@ def run_llm_chain(prompt, parse, settings, deadline, label, final_try=True, coun
     attempts = [("gemini", primary, 0), ("gemini", lite, 0)]
     if os.environ.get("GROQ_API_KEY"):
         groq_model = os.environ.get("GROQ_MODEL") or DEFAULT_GROQ_MODEL
-        attempts += [("groq", groq_model, 0), ("groq", groq_model, 65)]
+        attempts += [("groq", groq_model, 0)]
+        if groq_runner is None:
+            attempts += [("groq", groq_model, 65)]
+    groq_budget = groq_budget or GroqBudget()
     attempts += [("gemini", primary, settings["llm_backoff"] * 2**i) for i in range(settings["llm_retries"])]
     if final_try:
         attempts += [("gemini", primary, settings["llm_final_wait"])]
@@ -703,28 +707,25 @@ def run_llm_chain(prompt, parse, settings, deadline, label, final_try=True, coun
         if remaining < 1:
             break
         started = time.monotonic()
-        if on_attempt:
+        if on_attempt and provider != "groq":
             on_attempt()
         try:
             if provider not in clients:
                 clients[provider] = OpenAI(api_key=os.environ["GROQ_API_KEY"], base_url=GROQ_BASE_URL,
                                            max_retries=0, timeout=timeout)
-            request_options = {}
             if provider == "groq":
-                request_options = {"max_completion_tokens": 3000}
-                if model.startswith("openai/gpt-oss-"):
-                    request_options["extra_body"] = {"reasoning_effort": "low"}
-            resp = clients[provider].chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": groq_prompt if provider == "groq" and groq_prompt else prompt}],
-                response_format={"type": "json_object"},
-                temperature=0.2,
-                timeout=min(timeout, remaining),
-                **request_options,
-            )
-            result = parse(resp.choices[0].message.content)
+                content = (groq_runner(clients[provider], model) if groq_runner else
+                           request_groq(clients[provider], model, groq_prompt or prompt, settings,
+                                        deadline, groq_budget, on_attempt))
+            else:
+                resp = clients[provider].chat.completions.create(
+                    model=model, messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"}, temperature=0.2,
+                    timeout=min(timeout, remaining))
+                content = resp.choices[0].message.content
+            result = parse(content)
             if on_response:
-                on_response(resp.choices[0].message.content)
+                on_response(content)
         except Exception as e:
             last_error = e
             log.error("LLM %s attempt %d (%s) failed after %.0fs: %s",
@@ -985,11 +986,13 @@ def summarize_worker(items, settings, deadline, checkpoint, progress=None):
         result["replay_responses"] = dict(responses)
         checkpoint(result)
 
+    groq_budget = GroqBudget()
     digest = run_llm_chain(build_prompt(items, settings), lambda c: parse_digest(c, items, settings), settings,
                            deadline, "pass 1", count=story_count,
                            want=min(settings["min_stories"], len(items)),
                            accept_short=lambda d: d["selection_complete"], on_attempt=attempt,
                            groq_prompt=build_prompt(items, settings, evidence_chars=max(20, 7000 // max(1, len(items)))),
+                           groq_budget=groq_budget,
                            on_response=lambda content: responses.update(pass1=content))
     digest["quality"] = "pass_1"
     publish(digest)
@@ -1009,12 +1012,29 @@ def summarize_worker(items, settings, deadline, checkpoint, progress=None):
                     progress(metrics)
         publish(full)
         best = full
+        merged = {"stories": {}, "subject": None, "tldr": ""}
+
+        def record_rewrites(content):
+            nonlocal best
+            parsed = parse_summaries(content, len(stories))
+            for n, rewrite in parsed["stories"].items():
+                merged["stories"].setdefault(n, rewrite)
+            for key in ("subject", "tldr"):
+                if parsed.get(key):
+                    merged[key] = parsed[key]
+            responses["pass2"] = json.dumps({**merged, "stories": [dict(n=n, **s) for n, s in sorted(merged["stories"].items())]})
+            best = apply_rewrites(full, merged)
+            publish(best)
+
         summaries = run_llm_chain(build_summary_prompt(stories, items), lambda c: parse_summaries(c, len(stories)),
                                   settings, deadline, "pass 2", final_try=False,
                                   count=lambda d: len(d["stories"]), want=len(stories), on_attempt=attempt,
-                                  groq_prompt=build_summary_prompt(stories, items, evidence_chars=max(100, 6000 // max(1, 2 * len(stories)))),
-                                  on_response=lambda content: responses.update(pass2=content))
-        final = apply_rewrites(full, summaries)
+                                  groq_budget=groq_budget,
+                                  groq_runner=lambda client, model: summarize_batches(
+                                      client, model, stories, items, settings, deadline, groq_budget,
+                                      on_attempt=attempt, on_progress=record_rewrites),
+                                  on_response=record_rewrites)
+        final = best
         publish(final)
         return final
     except Exception as e:

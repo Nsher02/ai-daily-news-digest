@@ -224,3 +224,7 @@ __marimo__/
 
 # Private prepared editions and accepted-story history
 .digest-state/
+
+# Local live-verification output
+/groq-full-verification.html
+/groq-full-verification.json
