@@ -177,7 +177,7 @@ This Python monitoring helper is intentionally not enabled in production. The in
 
 The token lives **only in cron-job.org**. Never put it in the repo, this README or `.env`.
 
-1. **Token:** GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → Generate new token. Expiration: 1 year. Repository access: **Only select repositories** → `ai-daily-news-digest`. Repository permissions: **Actions: Read and write** (GitHub adds Metadata: Read-only automatically). Nothing else. **Add a calendar reminder a week before it expires**, because the main trigger stops working when it does (the GitHub cron backup keeps running).
+1. **Token:** GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → Generate new token. Expiration: 90 days (or another deliberately chosen finite lifetime). Repository access: **Only select repositories** → `ai-daily-news-digest`. Repository permissions: **Actions: Read and write** (GitHub adds Metadata: Read-only automatically). Nothing else. **Add a calendar reminder a week before it expires**, because the main trigger stops working when it does (the GitHub cron backup keeps running).
 2. **Job:** cron-job.org → Create cronjob, daily at **7:50**, time zone **America/Chicago**, with this request:
 
    ```
@@ -193,7 +193,7 @@ The token lives **only in cron-job.org**. Never put it in the repo, this README 
    Turn on its notifications for failed executions. GitHub answers a successful dispatch with HTTP 204 (no body).
 3. **Test:** use the job's test-run button, then check `gh run list --workflow daily-digest.yml -L 3`. A run named `AI Daily News Digest (external-schedule)` should appear. Outside 7:45–10:00 AM it logs `Skipping: … outside the … send window` and sends nothing.
 
-**To rotate the token:** create a new one the same way, paste it into the cron-job.org job's `Authorization` header, run a test, then delete the old token.
+**To rotate the token:** create a replacement with the same narrow permissions, update the cron-job.org Authorization header, and verify before revoking the old token. The Test/Run button can send a real digest; for a no-email review follow the [safe verification steps](docs/github-access-audit.md).
 
 **To change the time or time zone**, edit four places:
 
@@ -344,6 +344,10 @@ Groq uses a separate client, key, and endpoint. Only batching, evidence budgetin
 Gemini and Groq use the same editorial prompt, grounding rules, ID/link validation, coverage checks, and paragraph-length validator. For accessible articles with at least 800 characters, both are instructed to write 4–6 sentences around 90–160 words. Rewrites under 90 words or four sentences are retried instead of silently accepted. Source-poor stories keep the shorter evidence-only policy. Truncated outputs are rejected. Batch-local subjects and TLDRs never replace the edition-wide introduction. No paid-plan enrollment or provider upgrade is performed; keep the account on Free and review [your account limits](https://console.groq.com/settings/limits).
 
 Offline checks: `python -m unittest discover -s tests -v`. Local live verification requires `GROQ_API_KEY` and `LLM_API_KEY` in the environment; `python verify_groq.py` sends no email, while `python verify_groq.py --send-email` explicitly sends one labeled test after both stages pass. No additional SDK is required.
+
+## GitHub access and permissions
+
+The [GitHub access audit and manual token checklist](docs/github-access-audit.md) records the live repository settings and their limitations. Actions are restricted to the allowlisted action repositories with full SHA pins required. Checkouts do not persist credentials, and explicit workflow GitHub-token exposure is limited to send-window checking and state restoration. Dependabot alerts and weekly reviewable update PRs help maintain dependencies. The cron-job.org scheduler and Google monitor need separate, one-repository tokens with Actions write and Actions read access respectively; neither token belongs in the repository.
 
 ## Secrets
 
