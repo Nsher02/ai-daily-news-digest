@@ -36,6 +36,8 @@ CONFIG_PATH = Path(__file__).parent / "config.yaml"
 LLM_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 DEFAULT_LLM_MODEL = "gemini-3.5-flash"
 DEFAULT_LLM_LITE_MODEL = "gemini-3.5-flash-lite"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 NO_RETRY_STATUSES = {400, 401, 403, 404}  # retrying the same model won't help
 SECTIONS = ["Top stories", "AI models & labs", "Industry & funding", "Policy & society", "Research & tools"]
 
@@ -584,11 +586,14 @@ def clean_text(text, limit):
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
-def build_prompt(items, settings):
+def build_prompt(items, settings, evidence_chars=None):
     lines = []
     for i, item in enumerate(items):
         publishers = len({source_key(e["source"]) for e in item_evidence(item)})
-        lines.append(f"[{i}] {publishers} distinct publishers\n    {evidence_text(item)}")
+        evidence = evidence_text(item)
+        if evidence_chars is not None:
+            evidence = evidence[:evidence_chars]
+        lines.append(f"[{i}] {publishers} distinct publishers\n    {evidence}")
     return PROMPT.format(
         min_stories=min(settings["min_stories"], len(items)),
         max_stories=settings["max_stories"],
@@ -662,7 +667,7 @@ def describe_error(e):
     return f"{type(e).__name__}: {e}"
 
 
-def run_llm_chain(prompt, parse, settings, deadline, label, final_try=True, count=None, want=0, accept_short=None, on_attempt=None, on_response=None):
+def run_llm_chain(prompt, parse, settings, deadline, label, final_try=True, count=None, want=0, accept_short=None, on_attempt=None, on_response=None, groq_prompt=None):
     """Try primary, then lite immediately, then bounded primary retries and a final cooldown.
 
     parse(content) turns the model's reply into a result or raises. If count(result) < want, the result
@@ -673,15 +678,19 @@ def run_llm_chain(prompt, parse, settings, deadline, label, final_try=True, coun
     primary = os.environ.get("LLM_MODEL") or DEFAULT_LLM_MODEL
     lite = os.environ.get("LLM_LITE_MODEL") or DEFAULT_LLM_LITE_MODEL
 
-    attempts = [(primary, 0), (lite, 0)]
-    attempts += [(primary, settings["llm_backoff"] * 2**i) for i in range(settings["llm_retries"])]
+    clients = {"gemini": client}
+    attempts = [("gemini", primary, 0), ("gemini", lite, 0)]
+    if os.environ.get("GROQ_API_KEY"):
+        groq_model = os.environ.get("GROQ_MODEL") or DEFAULT_GROQ_MODEL
+        attempts += [("groq", groq_model, 0), ("groq", groq_model, 65)]
+    attempts += [("gemini", primary, settings["llm_backoff"] * 2**i) for i in range(settings["llm_retries"])]
     if final_try:
-        attempts += [(primary, settings["llm_final_wait"])]
+        attempts += [("gemini", primary, settings["llm_final_wait"])]
     dead_models, short, last_error = set(), None, None
 
-    for n, (model, wait) in enumerate(attempts, 1):
+    for n, (provider, model, wait) in enumerate(attempts, 1):
         final = final_try and n == len(attempts)
-        if model in dead_models or (final and short):
+        if (provider, model) in dead_models or (final and short):
             continue
         if final:
             # Shorten the cooldown so the last attempt can fit within the stage cap.
@@ -697,12 +706,21 @@ def run_llm_chain(prompt, parse, settings, deadline, label, final_try=True, coun
         if on_attempt:
             on_attempt()
         try:
-            resp = client.chat.completions.create(
+            if provider not in clients:
+                clients[provider] = OpenAI(api_key=os.environ["GROQ_API_KEY"], base_url=GROQ_BASE_URL,
+                                           max_retries=0, timeout=timeout)
+            request_options = {}
+            if provider == "groq":
+                request_options = {"max_completion_tokens": 3000}
+                if model.startswith("openai/gpt-oss-"):
+                    request_options["extra_body"] = {"reasoning_effort": "low"}
+            resp = clients[provider].chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": groq_prompt if provider == "groq" and groq_prompt else prompt}],
                 response_format={"type": "json_object"},
                 temperature=0.2,
                 timeout=min(timeout, remaining),
+                **request_options,
             )
             result = parse(resp.choices[0].message.content)
             if on_response:
@@ -714,7 +732,7 @@ def run_llm_chain(prompt, parse, settings, deadline, label, final_try=True, coun
             if isinstance(e, openai.APIStatusError) and (
                     e.status_code in NO_RETRY_STATUSES
                     or (e.status_code == 429 and "PerDay" in json.dumps(e.body))):  # daily quota: retrying won't help
-                dead_models.add(model)
+                dead_models.add((provider, model))
             continue
         got = count(result) if count else want
         log.info("LLM %s attempt %d (%s) succeeded in %.0fs (%d)", label, n, model, time.monotonic() - started, got)
@@ -900,15 +918,18 @@ def enrich_story(story, items, settings, deadline=None):
     return story
 
 
-def build_summary_prompt(stories, items):
+def build_summary_prompt(stories, items, evidence_chars=None):
     blocks = []
     for n, story in enumerate(stories, 1):
         lines = [f"=== Story {n} ===",
                  "Sources: " + ", ".join(dict.fromkeys(l["source"] for l in story["links"]))]
-        for i in story["ids"]:
-            lines.append("Feed evidence: " + evidence_text(items[i]))
+        evidence = "\n".join(evidence_text(items[i]) for i in story["ids"])
+        lines.append("Feed evidence: " + (evidence[:evidence_chars] if evidence_chars is not None else evidence))
         if story["article"]:
-            lines.append(f"ARTICLE TEXT ({story['article']['source']}):\n{story['article']['text']}")
+            text = story['article']['text']
+            if evidence_chars is not None:
+                text = text[:evidence_chars]
+            lines.append(f"ARTICLE TEXT ({story['article']['source']}):\n{text}")
         else:
             reason = story.get("article_reason") or "insufficient_text"
             lines.append(f"ARTICLE TEXT: unavailable ({reason}; use only the original feed evidence above)")
@@ -968,6 +989,7 @@ def summarize_worker(items, settings, deadline, checkpoint, progress=None):
                            deadline, "pass 1", count=story_count,
                            want=min(settings["min_stories"], len(items)),
                            accept_short=lambda d: d["selection_complete"], on_attempt=attempt,
+                           groq_prompt=build_prompt(items, settings, evidence_chars=max(20, 7000 // max(1, len(items)))),
                            on_response=lambda content: responses.update(pass1=content))
     digest["quality"] = "pass_1"
     publish(digest)
@@ -990,6 +1012,7 @@ def summarize_worker(items, settings, deadline, checkpoint, progress=None):
         summaries = run_llm_chain(build_summary_prompt(stories, items), lambda c: parse_summaries(c, len(stories)),
                                   settings, deadline, "pass 2", final_try=False,
                                   count=lambda d: len(d["stories"]), want=len(stories), on_attempt=attempt,
+                                  groq_prompt=build_summary_prompt(stories, items, evidence_chars=max(100, 6000 // max(1, 2 * len(stories)))),
                                   on_response=lambda content: responses.update(pass2=content))
         final = apply_rewrites(full, summaries)
         publish(final)

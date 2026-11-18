@@ -65,7 +65,7 @@ Pass 2 sends all stories in **one** request containing original feed titles, sni
 
 ### Failure behavior
 
-Each AI pass tries the primary model once, then immediately tries the backup if the primary fails or returns an incomplete selection. With current settings, it then retries the primary after 2 seconds and, if needed, makes one final primary attempt after a 15-second cooldown. Each request has a 60-second timeout bounded by the remaining stage deadline. Four full request timeouts plus waits consume about 257 seconds rather than exhausting the 600-second stage on one pass. Permanent model errors still skip later attempts for that model, and usable partial results remain available as fallbacks.
+Each AI pass tries Gemini primary, then Gemini Lite immediately. If both fail or provide an incomplete selection and `GROQ_API_KEY` is configured, it tries Groq as an independent provider. Groq gets at most two requests per pass, with a 65-second cooldown before its second attempt to allow free-tier token limits to reset. It then returns to the existing primary retry after 2 seconds and optional final primary attempt after 15 seconds. All calls and waits remain bounded by the shared 600-second stage deadline; permanent model errors skip later attempts for that provider/model. Without a Groq key, the Gemini-only sequence is unchanged.
 
 | Situation | What happens | Exit code |
 | --- | --- | --- |
@@ -332,12 +332,24 @@ To switch providers (OpenAI, OpenRouter, a local server, …), change `LLM_BASE_
 
 ---
 
+### Free Groq backup setup
+
+1. Sign in at [Groq Console](https://console.groq.com/) and stay on the Free plan. Create an API key named **AI Daily News Digest** under [API Keys](https://console.groq.com/keys).
+2. In this GitHub repository, open **Settings > Secrets and variables > Actions > New repository secret**. Save the key as **GROQ_API_KEY**. Never paste it into a prompt, code, or issue.
+3. The default model is **openai/gpt-oss-120b**, served by Groq, not the OpenAI API. Optionally set repository variable **GROQ_MODEL** to another compatible model ID. Gemini remains primary.
+4. The manually triggered **Verify Groq backup** workflow deliberately makes Gemini unavailable locally, calls real Groq for both stages on three clearly fictional source fixtures, and validates a full result. Enable its **send_email** input only when a test email is wanted. An incomplete result sends nothing; SMTP acceptance still does not confirm inbox delivery. The test does not change daily delivery receipts or story history.
+
+Groq uses a separate client, key, and endpoint. Only source evidence and editorial instructions are sent to it, with shorter evidence excerpts to reduce request size. Original IDs, links, grounding rules, and parsers are preserved; excerpts may result in shorter summaries. Requests allow up to 3,000 completion tokens and low reasoning effort for GPT-OSS models. Free-tier limits still apply and can prevent generation; an API key does not make paid usage free if the account is upgraded. Keep the account on Free and review [your account limits](https://console.groq.com/settings/limits). There is no automatic paid-plan enrollment or provider upgrade.
+
+Offline checks: `python -m unittest discover -s tests -v`. Local live verification requires `GROQ_API_KEY` and `LLM_API_KEY` in the environment; `python verify_groq.py` sends no email, while `python verify_groq.py --send-email` explicitly sends one labeled test after both stages pass. No additional SDK is required.
+
 ## Secrets
 
-The workflow reads seven repository secrets and exposes them to the script as environment variables of the same name.
+The workflow reads the following repository secrets. The optional Groq key is exposed only during preparation; SMTP credentials are used for sending.
 
 | Secret | What it is | Where it comes from | Example (placeholder) |
 | --- | --- | --- | --- |
+| `GROQ_API_KEY` | Optional independent backup API key | [Groq Console](https://console.groq.com/keys) | `<your-groq-api-key>` |
 | `LLM_API_KEY` | Gemini API key | [Google AI Studio](https://aistudio.google.com/) → Get API key | `<your-gemini-api-key>` |
 | `SMTP_HOST` | iCloud SMTP server | Apple's iCloud Mail settings | `smtp.mail.me.com` |
 | `SMTP_PORT` | SMTP port (STARTTLS) | Apple's iCloud Mail settings. Defaults to 587 if empty. | `587` |
@@ -346,7 +358,7 @@ The workflow reads seven repository secrets and exposes them to the script as en
 | `EMAIL_TO` | Where the digest is delivered | You choose | `<you>@icloud.com` |
 | `EMAIL_FROM` | The iCloud alias the digest is sent from. If empty or missing, the script sends from `SMTP_USER`. | iCloud Mail → Settings → Accounts → add an alias | `<your-alias>@icloud.com` |
 
-If `EMAIL_FROM` is missing the run still works. If any of the others is missing the run fails (a `KeyError` in the logs), except `SMTP_PORT`, which falls back to 587.
+If `EMAIL_FROM` is missing the run still works. If any of the required others is missing the run fails (a `KeyError` in the logs), except `SMTP_PORT`, which falls back to 587. Missing `GROQ_API_KEY` simply disables Groq.
 
 **Update a secret:** GitHub repo → **Settings** → **Secrets and variables** → **Actions** → click the secret → **Update secret** → paste the new value → save. The next run uses it; no code change or commit needed.
 
