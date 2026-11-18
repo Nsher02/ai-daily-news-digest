@@ -19,6 +19,15 @@
 - Account 2FA status was not returned by the current API response. Review [password and authentication settings](https://github.com/settings/security) if needed; this audit does not establish whether 2FA is enabled.
 - Repository APIs do not expose the actual permissions or expiry of the personal tokens stored at cron-job.org or Google Apps Script. Those must be inspected in the account UI. Secret names and update dates were checked without reading or exposing secret values.
 
+## External tokens confirmed by the owner
+
+On November 18, 2026, the owner reported checking the actual service tokens in GitHub and confirming the one-repository selections and permissions above:
+
+- cron-job.org scheduler: expires **November 1, 2027**; suggested renewal reminder **October 25, 2027**.
+- Google digest monitor: expires **November 12, 2027**; suggested renewal reminder **November 5, 2027**.
+
+These dates and permissions are owner-confirmed, not independently exposed by the repository API. No replacement or permission change is needed for these correctly scoped tokens. Their existing finite, roughly annual expiry was preserved; shortening to 90 days is optional and increases renewal work. No reminders were created automatically. The repository fork listing was also empty at audit time.
+
 ## Manual token review
 
 1. Open [Fine-grained personal access tokens](https://github.com/settings/personal-access-tokens). Inspect the actual token used for each service, not just a token with a similar name. Never post token values or screenshots containing them.
