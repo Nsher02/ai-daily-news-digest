@@ -30,13 +30,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      GH_TOKEN: ${{ github.token }}
       TRIGGER: ${{ inputs.trigger }}
       DIGEST_HISTORY_PATH: .digest-state/history.json
       DIGEST_PREPARED_PATH: .digest-state/prepared.json
       DIGEST_QUALITY_PATH: .digest-state/quality.json
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       # Scheduled runs (external or GitHub cron) send once, the first time one lands
       # between 7:45 and 10:00 AM Chicago. Plain manual runs always send.
@@ -61,6 +62,8 @@ jobs:
       - name: Restore digest state
         if: steps.guard.outputs.skip != 'true'
         run: python restore_state.py
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Prepare digest
         id: prepare
