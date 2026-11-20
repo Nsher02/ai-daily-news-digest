@@ -2,7 +2,13 @@
 
 This monitor uses your Google account to check the private GitHub repository independently of GitHub Actions. It runs free within Apps Script consumer quotas. It checks SMTP acceptance, using the same receipt name and early-manual-run exclusion as send_window.py. It does not inspect the recipient inbox.
 
+## Shared monitor and reader project
+
+If you have added the private reader to this project, use the combined manifest in [reader/appsscript.json](../reader/appsscript.json), not the monitor-only manifest here. Preserve Reader.gs, Index.html, OWNER_EMAIL, the existing monitor code/properties, and the hourly checkDigest trigger. See [the combined setup guide](../reader/README.md).
+
 ## Update an existing installation
+
+These steps apply to monitor-only projects. For a shared reader project, use the combined guide above.
 
 Repository pushes do not update your Google project automatically. In Apps Script, open **Project Settings**, enable **Show appsscript.json manifest file in editor**, then return to the editor. Replace **appsscript.json** with [the manifest in this folder](appsscript.json) and save. Preserve your existing Code.gs, Script properties, and trigger.
 

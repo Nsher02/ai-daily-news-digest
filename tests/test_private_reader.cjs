@@ -1,5 +1,5 @@
 const fs=require('fs'),vm=require('vm'),assert=require('assert/strict');
-const source=fs.readFileSync('reader/Code.gs','utf8');
+const source=fs.readFileSync('reader/Reader.gs','utf8');
 function setup(options={}) {
   let unzips=0;
   const requests=[],storage={}, record={digest_date:'2026-11-20',subject:'Daily subject',quality:'full',text_body:'Title\n\nTL;DR: Brief\n== Top stories ==\n* Headline\n  Summary\n  Source: https://example.com/story',recipient:'PRIVATE-INBOX',html_body:'<script>unsafe()</script>'};
@@ -38,7 +38,8 @@ s=setup();s.artifacts[0].expired=true;assert.equal(s.context.getReaderData().edi
 s=setup();s.artifacts[0].workflow_run.head_branch='other';assert.equal(s.context.getReaderData().edition.id,'11');
 s=setup();s.context.getReaderData();s.context.getReaderData('12');assert.ok(s.storage['last-reader-edition']);assert.ok(s.storage['reader-edition-12']);
 const manifest=JSON.parse(fs.readFileSync('reader/appsscript.json','utf8'));
-assert.equal(manifest.webapp.access,'MYSELF');assert.equal(manifest.webapp.executeAs,'USER_DEPLOYING');assert.equal(manifest.oauthScopes.some(x=>/auth\/(?:gmail|drive|script\.send_mail)/.test(x)),false);
+assert.equal(manifest.webapp.access,'MYSELF');assert.equal(manifest.webapp.executeAs,'USER_DEPLOYING');assert.equal(manifest.oauthScopes.includes('https://www.googleapis.com/auth/script.send_mail'),true);assert.equal(manifest.oauthScopes.some(x=>/auth\/(?:gmail|drive)/.test(x)),false);
+const combined=setup();vm.runInContext(fs.readFileSync('monitoring/google_apps_script.gs','utf8'),combined.context);assert.equal(typeof combined.context.checkDigest,'function');assert.equal(typeof combined.context.inspectDigest,'function');assert.equal(typeof combined.context.doGet,'function');
 const html=fs.readFileSync('reader/Index.html','utf8');assert.equal(/innerHTML|document\.write/.test(html),false);
 new vm.Script(html.match(/<script>([\s\S]*?)<\/script>/)[1]);
 console.log('Private reader checks passed: owner gate, display-only projection, redirects, archive selection, cache, stale state, manifest, and client syntax. No network or mail.');

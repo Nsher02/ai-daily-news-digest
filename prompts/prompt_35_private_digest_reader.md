@@ -1,8 +1,8 @@
 Implement a private Google Apps Script webpage alongside the existing email digest, using a branch and PR in the current private repository.
 
 1. IMPLEMENT
-   - Read existing main-branch digest artifacts with a dedicated Actions-read token; do not alter email delivery, schedules, or the monitor.
-   - Require the deploying owner's Google identity, use an owner-only deployment manifest, keep tokens server-side, and expose only display data. No public upload endpoint, mail/Drive scope, new account, or purchased domain.
+   - Read existing main-branch digest artifacts with the existing monitor’s Actions-read token; do not alter email delivery, schedules, or the monitor.
+   - Require the deploying owner's Google identity, use an owner-only deployment manifest, keep tokens server-side, and expose only display data. No public upload endpoint, new mail-reading/Drive scope, new account, or purchased domain. Retain the existing monitor email-sending scope in the combined project.
    - Show edition date, summary quality, sources, archive selection, refresh, stale/fallback notices, and optional bounded user cache. Preserve a readable prior edition where possible without pretending old content is current.
    - Validate artifact origin and redirects, never forward a GitHub token to storage, and render only escaped/text-node content. Keep credentials, recipient metadata, delivery state, and raw HTML out of the client.
 

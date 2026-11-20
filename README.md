@@ -347,7 +347,7 @@ Offline checks: `python -m unittest discover -s tests -v`. Local live verificati
 
 ## Private bookmarked reader
 
-An optional owner-only Google Apps Script webpage reads existing saved editions without changing email delivery or the monitor. It uses a dedicated read-only token, displays freshness and summary quality, and includes a short archive. Follow [reader/README.md](reader/README.md) for the three files, manual Google deployment, and phone/Mac privacy checks. No domain or new account is required. Repository updates alone do not create or update the live Google deployment.
+An optional owner-only Google Apps Script webpage reads existing saved editions without changing email delivery or the monitor. It reuses the monitor’s existing read-only token, displays freshness and summary quality, and includes a short archive. Follow [reader/README.md](reader/README.md) for the three files, manual Google deployment, and phone/Mac privacy checks. No domain or new account is required. Repository updates alone do not create or update the live Google deployment.
 
 ## Making future changes
 
