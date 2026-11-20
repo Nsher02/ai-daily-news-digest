@@ -4,7 +4,7 @@ This monitor uses your Google account to check the private GitHub repository ind
 
 ## Shared monitor and reader project
 
-If you have added the private reader to this project, use the combined manifest in [reader/appsscript.json](../reader/appsscript.json), not the monitor-only manifest here. Preserve Reader.gs, Index.html, OWNER_EMAIL, the existing monitor code/properties, and the hourly checkDigest trigger. See [the combined setup guide](../reader/README.md).
+If you have added the private reader to this project, use the combined manifest in [reader/appsscript.json](../reader/appsscript.json), not the monitor-only manifest here. Preserve Reader.gs, Index.html, OWNER_EMAIL, the existing monitor code/properties, and the hourly checkDigest trigger. See [the combined setup guide](../reader/README.md). Before adding an anonymous Safari test deployment, follow [the shared-project safeguards and migration](../reader/SAFARI_TEST.md). That procedure uses reader/Monitor.gs instead of the standalone monitor in this folder, and retargets the existing hourly trigger to checkDigest_. The receipt logic and hourly frequency remain the same.
 
 ## Update an existing installation
 
