@@ -1,41 +1,37 @@
 # Private digest reader — Google Apps Script
 
-A free, owner-only bookmarked webpage that reads existing digest artifacts from the private GitHub repository. Email delivery, its schedule, and the missing-email monitor are unchanged. No new account, domain, public upload endpoint, Drive access, email permission, or AI call is required to read the page. No new time-driven trigger is needed: the page reads saved editions when opened or refreshed.
+A free, owner-only bookmarked webpage that reads existing digest artifacts from the private GitHub repository. Email delivery, its schedule, and the missing-email monitor are unchanged. No new account, domain, public upload endpoint, Drive access, email-reading permission, or AI call is required to read the page. No new time-driven trigger is needed: the page reads saved editions when opened or refreshed.
 
-## 1. Create a separate Google project
+## 1. Reuse and rename your monitor project
 
-Open https://script.google.com/ under the Google account you want to use on both phone and Mac. Create a new project named **AI Daily News Digest — Private Reader**. Keep the project private and separate from the monitor. Project editors can access its Script properties, so do not share editor access.
+Open https://script.google.com/ and open your existing **AI Daily News Digest Monitor** project. Click its title and rename it **AI Daily News Digest — Monitor & Reader**. This is the same project, not a new account or subscription. Keep editor access private.
 
-## 2. Copy three files
+Preserve the existing **Code.gs** monitor code, **GITHUB_TOKEN**, **ALERT_EMAIL**, **LAST_CHECK_DATE**, **LAST_CHECK_STATUS**, and the existing hourly **checkDigest** trigger. Renaming the project does not require a new token or replacement trigger.
 
-1. In the editor, replace **Code.gs** with the contents of [Code.gs](Code.gs).
-2. Use the **+** beside Files > **HTML**. Name it **Index** and replace its contents with [Index.html](Index.html).
-3. Open **Project Settings** (gear). Enable **Show “appsscript.json” manifest file in editor**. Return to Editor, select **appsscript.json**, and replace its contents with [appsscript.json](appsscript.json).
-4. Save all files. The manifest requests only external HTTP requests and your basic account email for the owner check. It requests no permission to read or send mail or access Drive. It specifies web-app access `MYSELF` and execution as `USER_DEPLOYING`.
+## 2. Add reader files without replacing the monitor
 
-## 3. Configure identity and read-only access
+1. In the editor use **+ > Script**. Name the new file **Reader** and paste [Reader.gs](Reader.gs) into it. Leave the existing monitor **Code.gs** unchanged.
+2. Use **+ > HTML**, name it **Index**, and replace the new file's contents with [Index.html](Index.html).
+3. In **Project Settings** enable **Show “appsscript.json” manifest file in editor**. Return to Editor and replace the manifest with [appsscript.json](appsscript.json).
+4. Save. This combined manifest retains external requests and **sending email**, which your monitor already needs, and adds basic account email for the reader's owner check. It requests no inbox-reading or Drive permission. The web-app setting is **MYSELF**, executed as the deploying owner.
 
-Create a separate [fine-grained GitHub token](https://github.com/settings/personal-access-tokens/new) named **AI Daily News Digest — Private Reader**:
+The shared project retains its ability to send monitoring alerts; the reader itself contains no mail-sending operation. The two functions share a project and authorization grant, so they are not isolated from one another. Do not change deployment access to Anyone.
 
-- Resource owner: **Nsher02**.
-- Repository access: **Only select repositories > ai-daily-news-digest**.
-- Repository permissions: **Actions: Read-only** and automatically included **Metadata: Read-only**. No Contents, Workflows, Administration, or write permissions.
-- Choose a finite expiration and a renewal reminder. A 90-day expiry is reasonable if you are comfortable renewing quarterly.
+## 3. Add only the owner identity property
 
-In the new Google project, open **Project Settings > Script properties** and add:
+Open **Project Settings > Script properties**. Keep all existing properties and add:
 
 | Property | Value |
 | --- | --- |
-| `OWNER_EMAIL` | The Google account email you are using to own and deploy this project—not necessarily the iCloud recipient address. |
-| `GITHUB_TOKEN` | The new read-only token. |
+| `OWNER_EMAIL` | The exact Google account email owning and deploying this project—not necessarily your iCloud recipient address. |
 
-Save the properties. Keep the token here only, not in the source, GitHub issues, screenshots, a URL, or chat. Do not change your existing monitor token or add this token to GitHub repository secrets.
+Reuse the monitor's existing **GITHUB_TOKEN**, already restricted to this repository with **Actions: Read-only** and automatic Metadata read access. No new token or GitHub repository secret is needed. The reader does not use ALERT_EMAIL or change monitor state. Never share the token in chat, source files, screenshots, or URLs.
 
 ## 4. Perform the safe setup check
 
-In the editor select **inspectReader** and click **Run**. Review Google's authorization request; the expected permissions are basic account email and external connections. The developer/project should be your own. If the account, project, or requested permissions differ, stop and review them.
+In the editor select **inspectReader** and click **Run**. Review Google's authorization request; the expected permissions are basic account email, external connections, and the existing monitor’s email-sending permission. The developer/project should be your own. If the account, project, or requested permissions differ, stop and review them.
 
-A successful execution logs only an edition date, summary quality, and stale/cache flags. It does not print the token, recipient, or raw digest, and sends no email. A stale date means the saved digest is older than today's Chicago date; it does not prove email failed. A `raw_headlines` or `partial_pass_2` result describes summary completeness.
+Select **inspectReader**, not checkDigest, for this setup. A successful execution logs only an edition date, summary quality, and stale/cache flags. It does not print the token, recipient, or raw digest, and sends no email. A stale date means the saved digest is older than today's Chicago date; it does not prove email failed. A `raw_headlines` or `partial_pass_2` result describes summary completeness.
 
 If access is denied, check the exact Google email in OWNER_EMAIL, the account selected in the editor, and that the manifest is saved. Blank or non-owner identities are rejected rather than allowed through. Do not weaken the identity check to work around an account mismatch.
 
@@ -76,7 +72,7 @@ From the repository root:
 
 ```sh
 node tests/test_private_reader.cjs
-node --check < reader/Code.gs
+node --check < reader/Reader.gs
 python3 -m json.tool reader/appsscript.json
 ```
 
@@ -84,4 +80,4 @@ The privacy checks simulate owner and unauthorized identities, API failures, cac
 
 ## Stop the page without affecting email
 
-Archive the reader's web-app deployment and revoke only its dedicated GitHub token. Leave the digest workflow and monitor project unchanged.
+Archive only the web-app deployment. Keep the shared GITHUB_TOKEN and checkDigest trigger, which the monitor still uses. Leave the digest workflow unchanged.
