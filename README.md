@@ -345,6 +345,10 @@ Gemini and Groq use the same editorial prompt, grounding rules, ID/link validati
 
 Offline checks: `python -m unittest discover -s tests -v`. Local live verification requires `GROQ_API_KEY` and `LLM_API_KEY` in the environment; `python verify_groq.py` sends no email, while `python verify_groq.py --send-email` explicitly sends one labeled test after both stages pass. No additional SDK is required.
 
+## Private bookmarked reader
+
+An optional owner-only Google Apps Script webpage reads existing saved editions without changing email delivery or the monitor. It reuses the monitor’s existing read-only token, displays freshness and summary quality, and includes a short archive. Follow [reader/README.md](reader/README.md) for the three files, manual Google deployment, and phone/Mac privacy checks. No domain or new account is required. Repository updates alone do not create or update the live Google deployment.
+
 ## Making future changes
 
 Follow [CONTRIBUTING.md](CONTRIBUTING.md): use a `codex/` branch and pull request, then merge through `python3 scripts/merge_pr.py NUMBER` only after the current commit passes **Offline regression tests** and includes the latest `main`. The local pre-push hook blocks direct pushes to `main` when installed. Persistent agent instructions enforce this working convention; GitHub Free does not provide server-enforced branch protection for this private repository. No automatic merging or additional credentials are enabled.
