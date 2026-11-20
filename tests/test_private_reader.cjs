@@ -7,11 +7,11 @@ function setup(options={}) {
   const artifacts=[{id:12,name:'digest-state-final-7-1',created_at:'2026-11-20T13:55:00Z',workflow_run:{id:7,head_branch:'main'}}, {id:11,name:'digest-state-prepared-7-1',created_at:'2026-11-20T13:54:00Z',workflow_run:{id:7,head_branch:'main'}}];
   const blob=value=>({getBytes:()=>Buffer.from(value),getName:()=> 'prepared.json',getDataAsString:()=>value,setContentType(){return this;}});
   const response=(code,data,headers={})=>({getResponseCode:()=>code,getContentText:()=>JSON.stringify(data),getAllHeaders:()=>headers,getBlob:()=>blob('zip')});
-  const context=vm.createContext({console:{log(){}},PropertiesService:{getScriptProperties:()=>({getProperty:k=>properties[k]})},
+  const context=vm.createContext({console:{log(){},error(){}},PropertiesService:{getScriptProperties:()=>({getProperty:k=>properties[k]})},
     Session:{getActiveUser:()=>({getEmail:()=>options.identity===undefined?'owner@example.com':options.identity})},
     CacheService:{getUserCache:()=>({get:k=>storage[k],put:(k,v)=>{storage[k]=v;}})},
     Utilities:{newBlob:blob,unzip:()=>[blob((options.corrupt || (options.corruptFirst && ++unzips===1))?'not JSON':JSON.stringify(record))],formatDate:(date,zone,pattern)=>pattern==='yyyy-MM-dd'?'2026-11-20':'Nov 20, 2026 07:55'},
-    HtmlService:{createHtmlOutputFromFile:()=>({setTitle(){return this;},addMetaTag(){return this;}}),createHtmlOutput:t=>({text:t})},
+    HtmlService:{createHtmlOutputFromFile:()=>{if(options.missingTemplate)throw new Error('missing Index');return {setTitle(){return this;},addMetaTag(){return this;}};},createHtmlOutput:t=>({text:t})},
     UrlFetchApp:{fetch:(url,config)=>{
       requests.push({url,config});
       if(options.down)return response(503,{});
@@ -25,6 +25,7 @@ function setup(options={}) {
 for(const identity of ['','other@example.com']) {
   const s=setup({identity});assert.throws(()=>s.context.getReaderData(),/Access denied/);assert.equal(s.requests.length,0);assert.equal(s.context.doGet().text.startsWith('Access denied'),true);
 }
+assert.match(setup({missingTemplate:true}).context.doGet().text,/HTML file named Index/);
 let s=setup(),data=s.context.getReaderData();assert.equal(data.edition.id,'12');assert.equal(data.editions.length,1);assert.equal(data.stale,false);
 assert.equal(JSON.stringify(data).includes('PRIVATE-INBOX'),false);assert.equal(JSON.stringify(data).includes('PRIVATE-TOKEN'),false);assert.equal(JSON.stringify(data).includes('<script>'),false);
 const download=s.requests.find(r=>r.url.includes('blob.core.windows.net'));assert.equal(download.config.headers,undefined);assert.equal(download.config.followRedirects,false);
@@ -46,6 +47,7 @@ console.log('Private reader checks passed: owner gate, display-only projection, 
 // Exercise the actual client renderer with malicious-looking source text.
 class Element {
   constructor(tag){this.tag=tag;this.children=[];this.textContent='';this.handlers={};}
+  querySelector(selector){for(const child of this.children){if(selector.startsWith('.')?(child.className||'').split(' ').includes(selector.slice(1)):child.tag===selector)return child;const match=child.querySelector(selector);if(match)return match;}return null;}
   appendChild(node){this.children.push(node);return node;}
   replaceChildren(){this.children=[];}
   addEventListener(name,fn){this.handlers[name]=fn;}
@@ -59,7 +61,9 @@ const descendants=node=>[node,...node.children.flatMap(descendants)];
 const nodes=descendants(elements.content);
 assert.equal(elements.subject.textContent,'<script>attack()</script>');
 assert.equal(nodes.some(n=>n.tag==='img'||n.tag==='script'),false);
-const links=nodes.filter(n=>n.tag==='a');assert.equal(links.length,1);assert.equal(links[0].rel,'noopener noreferrer');
+const links=nodes.filter(n=>n.tag==='a');assert.equal(links.length,2);assert.equal(links[0].rel,'noopener noreferrer');
 assert.equal(links[0].href,'https://example.com/article');
+assert.equal(links[1].href,'https://example.com/article');
+assert.equal(links[0].textContent,'<img onerror=attack()>');
 elements.subject.textContent='';onFailure();assert.equal(elements.status.textContent,'Reader unavailable');
 console.log('Client rendering checks passed: literal untrusted text, safe source links, and clear load failure.');

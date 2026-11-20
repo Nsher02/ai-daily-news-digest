@@ -11,10 +11,15 @@ function assertReaderOwner_() {
 function doGet() {
   try {
     assertReaderOwner_();
+  } catch (_) {
+    return HtmlService.createHtmlOutput('Access denied. Sign in with the reader owner account.');
+  }
+  try {
     return HtmlService.createHtmlOutputFromFile('Index').setTitle('AI Daily News Digest')
       .addMetaTag('viewport', 'width=device-width, initial-scale=1');
   } catch (_) {
-    return HtmlService.createHtmlOutput('Access denied. Sign in with the reader owner account.');
+    console.error('Reader template could not be loaded. Verify an HTML file named Index exists.');
+    return HtmlService.createHtmlOutput('Reader page could not load. Check that the project contains an HTML file named Index, then save and update the deployment.');
   }
 }
 

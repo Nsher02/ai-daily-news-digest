@@ -81,3 +81,15 @@ The privacy checks simulate owner and unauthorized identities, API failures, cac
 ## Stop the page without affecting email
 
 Archive only the web-app deployment. Keep the shared GITHUB_TOKEN and checkDigest trigger, which the monitor still uses. Leave the digest workflow unchanged.
+
+## Clean up setup diagnostics and match the email design
+
+After the page works, replace the entire live **Reader.gs** with this repository's version. This removes the temporary `inspectReaderIdentity()` function, its call in `doGet()`, and the temporary staged `stage` / `errorType` / `reason` logging. Keep the permanent owner check and `inspectReader()` setup check. The production `doGet()` distinguishes an owner denial from a missing HTML template without logging account identities or raw errors.
+
+Replace the contents of the existing **Index.html** with the current version here. Create it with **+ > HTML > Index** only if it is missing; Google adds the extension. Keep exactly the HTML template referenced as `Index`. Delete a mistaken duplicate only after confirming it is unused. Do not delete the working template.
+
+Keep the monitor's **Code.gs**, combined **appsscript.json**, all existing Script Properties (including OWNER_EMAIL), and the hourly **checkDigest** trigger. Execution history can remain; no new trigger or token is needed.
+
+Save, then update the existing deployment using **Deploy > Manage deployments > pencil > Version: New version > Deploy**. Confirm **Execute as: Me** and **Only myself**. Open the existing `/exec` bookmark to verify it, including on your iPhone. The `/dev` test page uses saved editor code; an existing `/exec` deployment needs this version update. No email test is needed.
+
+The reader now follows the email's 600px column, black-to-grey header fade, two-line Good Morning masthead, pink Top stories label, serif headlines and top-story summaries, section rules, and full-width #2c2c2c disclosure area. Reader controls and edition status remain above the content. Stored email HTML is still excluded, and remote thumbnails remain omitted to avoid loading third-party image assets.
