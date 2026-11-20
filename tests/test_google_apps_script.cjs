@@ -1,7 +1,10 @@
 const fs = require('fs');
 const vm = require('vm');
 const assert = require('assert/strict');
-const source = fs.readFileSync('monitoring/google_apps_script.gs', 'utf8');
+const shared = process.argv.includes('--shared');
+const source = fs.readFileSync(shared ? 'reader/Monitor.gs' : 'monitoring/google_apps_script.gs', 'utf8');
+const checkName = shared ? 'checkDigest_' : 'checkDigest';
+const inspectName = shared ? 'inspectDigestSetup_' : 'inspectDigest';
 function setup({receipt = true, hour = 16, status = 200, earlyManual = false, failMail = false} = {}) {
   const store = {GITHUB_TOKEN: 'offline-token', ALERT_EMAIL: 'reader@example.com'};
   const emails = [];
@@ -29,12 +32,12 @@ function setup({receipt = true, hour = 16, status = 200, earlyManual = false, fa
   return {context, store, emails, requests: () => requests};
 }
 let s = setup();
-s.context.checkDigest(); s.context.checkDigest();
+s.context[checkName](); s.context[checkName]();
 assert.equal(s.emails.length, 0); assert.equal(s.store.LAST_CHECK_STATUS, 'smtp_accepted'); assert.equal(s.requests(), 2);
-s = setup({receipt: false}); s.context.checkDigest(); s.context.checkDigest(); assert.equal(s.emails.length, 1);
-s = setup({status: 403}); s.context.checkDigest(); assert.equal(s.store.LAST_CHECK_STATUS, 'verification_failed'); assert.equal(s.emails.length, 1);
-s = setup({hour: 14}); s.context.checkDigest(); assert.equal(s.requests(), 0); assert.equal(s.emails.length, 0);
-s = setup({earlyManual: true}); s.context.checkDigest(); assert.equal(s.emails.length, 1);
-s = setup({receipt: false}); s.context.inspectDigest(); assert.equal(s.emails.length, 0); assert.equal(s.store.LAST_CHECK_DATE, undefined);
-s = setup({receipt: false, failMail: true}); assert.throws(() => s.context.checkDigest()); assert.equal(s.store.LAST_CHECK_DATE, undefined);
-console.log('7 mocked monitor scenarios passed. No network calls or email sends.');
+s = setup({receipt: false}); s.context[checkName](); s.context[checkName](); assert.equal(s.emails.length, 1);
+s = setup({status: 403}); s.context[checkName](); assert.equal(s.store.LAST_CHECK_STATUS, 'verification_failed'); assert.equal(s.emails.length, 1);
+s = setup({hour: 14}); s.context[checkName](); assert.equal(s.requests(), 0); assert.equal(s.emails.length, 0);
+s = setup({earlyManual: true}); s.context[checkName](); assert.equal(s.emails.length, 1);
+s = setup({receipt: false}); s.context[inspectName](); assert.equal(s.emails.length, 0); assert.equal(s.store.LAST_CHECK_DATE, undefined);
+s = setup({receipt: false, failMail: true}); assert.throws(() => s.context[checkName]()); assert.equal(s.store.LAST_CHECK_DATE, undefined);
+console.log((shared ? 'Shared project: ' : 'Standalone: ') + '7 mocked monitor scenarios passed. No network calls or email sends.');
