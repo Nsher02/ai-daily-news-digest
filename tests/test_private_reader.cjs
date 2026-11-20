@@ -1,17 +1,18 @@
 const fs=require('fs'),vm=require('vm'),assert=require('assert/strict');
 const source=fs.readFileSync('reader/Reader.gs','utf8');
 function setup(options={}) {
-  let unzips=0;
+  let unzips=0, cacheReads=0;
+  const templates=[], logs=[];
   const requests=[],storage={}, record={digest_date:'2026-11-20',subject:'Daily subject',quality:'full',text_body:'Title\n\nTL;DR: Brief\n== Top stories ==\n* Headline\n  Summary\n  Source: https://example.com/story',recipient:'PRIVATE-INBOX',html_body:'<script>unsafe()</script>'};
   const properties={OWNER_EMAIL:'owner@example.com',GITHUB_TOKEN:'PRIVATE-TOKEN'};
   const artifacts=[{id:12,name:'digest-state-final-7-1',created_at:'2026-11-20T13:55:00Z',workflow_run:{id:7,head_branch:'main'}}, {id:11,name:'digest-state-prepared-7-1',created_at:'2026-11-20T13:54:00Z',workflow_run:{id:7,head_branch:'main'}}];
   const blob=value=>({getBytes:()=>Buffer.from(value),getName:()=> 'prepared.json',getDataAsString:()=>value,setContentType(){return this;}});
   const response=(code,data,headers={})=>({getResponseCode:()=>code,getContentText:()=>JSON.stringify(data),getAllHeaders:()=>headers,getBlob:()=>blob('zip')});
-  const context=vm.createContext({console:{log(){},error(){}},PropertiesService:{getScriptProperties:()=>({getProperty:k=>properties[k]})},
+  const context=vm.createContext({console:{log(value){logs.push(value);},error(value){logs.push(value);}},PropertiesService:{getScriptProperties:()=>({getProperty:k=>properties[k]})},
     Session:{getActiveUser:()=>({getEmail:()=>options.identity===undefined?'owner@example.com':options.identity})},
-    CacheService:{getUserCache:()=>({get:k=>storage[k],put:(k,v)=>{storage[k]=v;}})},
+    CacheService:{getUserCache:()=>({get:k=>{cacheReads++;return storage[k];},put:(k,v)=>{storage[k]=v;}})},
     Utilities:{newBlob:blob,unzip:()=>[blob((options.corrupt || (options.corruptFirst && ++unzips===1))?'not JSON':JSON.stringify(record))],formatDate:(date,zone,pattern)=>pattern==='yyyy-MM-dd'?'2026-11-20':'Nov 20, 2026 07:55'},
-    HtmlService:{createHtmlOutputFromFile:()=>{if(options.missingTemplate)throw new Error('missing Index');return {setTitle(){return this;},addMetaTag(){return this;}};},createHtmlOutput:t=>({text:t})},
+    HtmlService:{createHtmlOutputFromFile:name=>{templates.push(name);if(options.missingTemplate)throw new Error('missing Index');return {template:name,setTitle(){return this;},addMetaTag(){return this;}};},createHtmlOutput:t=>({text:t})},
     UrlFetchApp:{fetch:(url,config)=>{
       requests.push({url,config});
       if(options.down)return response(503,{});
@@ -20,7 +21,7 @@ function setup(options={}) {
       if(url.endsWith('/zip'))return response(302,{}, {Location:options.badRedirect?'https://attacker.example/zip':'https://signed.blob.core.windows.net/zip?sig=private'});
       return response(200,{});
     }}
-  });vm.runInContext(source,context);return {context,requests,storage,record,options,properties,artifacts};
+  });vm.runInContext(source,context);return {context,requests,storage,record,options,properties,artifacts,templates,logs,cacheReads:()=>cacheReads};
 }
 for(const identity of ['','other@example.com']) {
   const s=setup({identity});assert.throws(()=>s.context.getReaderData(),/Access denied/);assert.equal(s.requests.length,0);assert.equal(s.context.doGet().text.startsWith('Access denied'),true);
@@ -40,7 +41,7 @@ s=setup();s.artifacts[0].workflow_run.head_branch='other';assert.equal(s.context
 s=setup();s.context.getReaderData();s.context.getReaderData('12');assert.ok(s.storage['last-reader-edition']);assert.ok(s.storage['reader-edition-12']);
 const manifest=JSON.parse(fs.readFileSync('reader/appsscript.json','utf8'));
 assert.equal(manifest.webapp.access,'MYSELF');assert.equal(manifest.webapp.executeAs,'USER_DEPLOYING');assert.equal(manifest.oauthScopes.includes('https://www.googleapis.com/auth/script.send_mail'),true);assert.equal(manifest.oauthScopes.some(x=>/auth\/(?:gmail|drive)/.test(x)),false);
-const combined=setup();vm.runInContext(fs.readFileSync('monitoring/google_apps_script.gs','utf8'),combined.context);assert.equal(typeof combined.context.checkDigest,'function');assert.equal(typeof combined.context.inspectDigest,'function');assert.equal(typeof combined.context.doGet,'function');
+const combined=setup();vm.runInContext(fs.readFileSync('reader/Monitor.gs','utf8'),combined.context);assert.equal(typeof combined.context.checkDigest_,'function');assert.equal(typeof combined.context.inspectDigestSetup_,'function');assert.equal(typeof combined.context.doGet,'function');
 const html=fs.readFileSync('reader/Index.html','utf8');assert.equal(/innerHTML|document\.write/.test(html),false);
 new vm.Script(html.match(/<script>([\s\S]*?)<\/script>/)[1]);
 console.log('Private reader checks passed: owner gate, display-only projection, redirects, archive selection, cache, stale state, manifest, and client syntax. No network or mail.');
@@ -67,3 +68,36 @@ assert.equal(links[1].href,'https://example.com/article');
 assert.equal(links[0].textContent,'<img onerror=attack()>');
 elements.subject.textContent='';onFailure();assert.equal(elements.status.textContent,'Reader unavailable');
 console.log('Client rendering checks passed: literal untrusted text, safe source links, and clear load failure.');
+
+// Public deployment safety: inspect the whole shared-project callable surface.
+const standaloneMonitor=fs.readFileSync('monitoring/google_apps_script.gs','utf8');
+const sharedMonitor=fs.readFileSync('reader/Monitor.gs','utf8');
+const stripHeader=text=>text.slice(text.indexOf('const DIGEST_REPOSITORY'));
+assert.equal(stripHeader(sharedMonitor),stripHeader(standaloneMonitor)
+  .replace('function inspectDigest() {','function inspectDigestSetup_() {')
+  .replace('function checkDigest() {','function checkDigest_() {'));
+const publicNames=Object.keys(combined.context).filter(name=>typeof combined.context[name]==='function'&&!name.endsWith('_')).sort();
+assert.deepEqual(publicNames,['doGet','getReaderData','inspectReader']);
+assert.equal(combined.context.checkDigest,undefined);assert.equal(combined.context.inspectDigest,undefined);
+for(const identity of ['', 'other@example.com']) {
+  const denied=setup({identity});
+  vm.runInContext(sharedMonitor,denied.context);
+  const before=JSON.stringify(denied.properties);
+  denied.storage['last-reader-edition']=JSON.stringify({edition:denied.record});
+  assert.equal(denied.context.doGet({parameter:{view:'safari-test'}}).template,'SafariTest');
+  assert.match(denied.context.doGet().text,/Access denied/);
+  assert.match(denied.context.doGet({parameter:{view:'Index',OWNER_EMAIL:identity}}).text,/Access denied/);
+  assert.throws(()=>denied.context.getReaderData(),/Access denied/);
+  assert.throws(()=>denied.context.getReaderData({owner:'owner@example.com',triggerUid:'forged'}),/Access denied/);
+  assert.throws(()=>denied.context.inspectReader(),/Access denied/);
+  assert.equal(denied.requests.length,0);assert.equal(denied.cacheReads(),0);
+  assert.equal(JSON.stringify(denied.properties),before);assert.equal(denied.logs.length,0);
+}
+const testHtml=fs.readFileSync('reader/SafariTest.html','utf8');
+assert.match(testHtml,/Digest login test/);
+assert.equal(/<script\b|<form\b|<iframe\b|<img\b|\bsrc\s*=|google\.script|https?:\/\//i.test(testHtml),false);
+assert.match(testHtml,/<input[^>]*type="password"[^>]*disabled/);
+assert.match(testHtml,/<button[^>]*disabled/);
+assert.equal(/GITHUB_TOKEN|OWNER_EMAIL|ALERT_EMAIL/.test(testHtml),false);
+assert.equal(setup().context.doGet().template,'Index');
+console.log('Shared-project safeguards passed: private monitor handlers, unchanged monitor logic, static Safari route, and no anonymous data/cache/network/state access.');
