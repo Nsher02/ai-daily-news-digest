@@ -1,5 +1,7 @@
 # Private digest reader — Google Apps Script
 
+**Safari access test in this same project:** follow [SAFARI_TEST.md](SAFARI_TEST.md) before creating any anonymous deployment. That optional procedure replaces Code.gs with a private-handler variant and retargets the existing hourly trigger; the normal private-reader instructions below otherwise remain unchanged. Do not mix the two monitor variants.
+
 A free, owner-only bookmarked webpage that reads existing digest artifacts from the private GitHub repository. Email delivery, its schedule, and the missing-email monitor are unchanged. No new account, domain, public upload endpoint, Drive access, email-reading permission, or AI call is required to read the page. No new time-driven trigger is needed: the page reads saved editions when opened or refreshed.
 
 ## 1. Reuse and rename your monitor project

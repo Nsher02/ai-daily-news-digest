@@ -8,7 +8,12 @@ function assertReaderOwner_() {
   if (!owner || !active || owner !== active) throw new Error('Access denied. Sign in with the reader owner account.');
 }
 
-function doGet() {
+function doGet(e) {
+  // Static, content-free route only. No identity, cache, GitHub, or mail access.
+  if (e && e.parameter && e.parameter.view === 'safari-test') {
+    return HtmlService.createHtmlOutputFromFile('SafariTest').setTitle('Digest Safari Access Test')
+      .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  }
   try {
     assertReaderOwner_();
   } catch (_) {
