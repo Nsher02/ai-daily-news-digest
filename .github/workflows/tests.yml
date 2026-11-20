@@ -34,7 +34,11 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Run mocked Google monitor tests
         run: node tests/test_google_apps_script.cjs
+      - name: Run private reader privacy and fallback checks
+        run: node tests/test_private_reader.cjs
       - name: Check Google monitor syntax and manifest
         run: |
           node --check < monitoring/google_apps_script.gs
           python -m json.tool monitoring/appsscript.json > /dev/null
+          node --check < reader/Reader.gs
+          python -m json.tool reader/appsscript.json > /dev/null
