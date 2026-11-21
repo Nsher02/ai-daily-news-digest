@@ -345,9 +345,11 @@ Gemini and Groq use the same editorial prompt, grounding rules, ID/link validati
 
 Offline checks: `python -m unittest discover -s tests -v`. Local live verification requires `GROQ_API_KEY` and `LLM_API_KEY` in the environment; `python verify_groq.py` sends no email, while `python verify_groq.py --send-email` explicitly sends one labeled test after both stages pass. No additional SDK is required.
 
-## Private bookmarked reader
+## Email-only delivery
 
-An optional owner-only Google Apps Script webpage reads existing saved editions without changing email delivery or the monitor. It reuses the monitor’s existing read-only token, displays freshness and summary quality, and includes a short archive. Follow [reader/README.md](reader/README.md) for the reader files, manual Google deployment, and phone/Mac privacy checks. A separate [same-project Safari access test](reader/SAFARI_TEST.md) provides a content-free test route and private monitor handlers; it requires a manual trigger-handler update before any anonymous deployment. No domain or new account is required. Repository updates alone do not create or update the live Google deployment.
+The hosted reader and Safari test have been removed. The digest continues to be generated and sent through the existing GitHub Actions workflow and iCloud SMTP settings; no website, domain, or web deployment is required. Historical implementation prompts and original design images remain in the repository.
+
+The optional [Google Apps Script monitor](monitoring/README.md) is separate from email delivery. Keeping it provides an independent alert when the expected SMTP receipt is missing or GitHub cannot be checked. It requires no web deployment. If you previously added the reader to that project, follow the [live web-hosting removal steps](monitoring/README.md#remove-the-former-reader-and-keep-the-monitor): repository cleanup does not archive live Google deployments or update their files and triggers. Deleting the entire Google project also removes its independent monitoring, but does not stop the daily digest email.
 
 ## Making future changes
 
