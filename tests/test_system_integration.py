@@ -69,6 +69,35 @@ class PreparedWorkflowTests(unittest.TestCase):
             self.assertIn('outcome=sent', (self.root / 'output').read_text())
             self.assertEqual(json.loads((self.root / 'quality.json').read_text())[0]['quality'], 'raw_headlines')
 
+    def test_encrypted_artifact_round_trip_preserves_message_and_duplicate_guard(self):
+        from cryptography.fernet import Fernet
+        import state_crypto
+        with patch.dict(os.environ, dict(self.env, DIGEST_STATE_KEY=Fernet.generate_key().decode()), clear=True):
+            self.prepare()
+            before = json.loads((self.root / 'prepared.json').read_text())
+            sealed = self.root / 'upload' / 'state.enc'
+            state_crypto.seal_directory(self.root, sealed, 'owner/repo', 'main')
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, 'w') as archive:
+                archive.writestr('state.enc', sealed.read_bytes())
+            (self.root / 'prepared.json').unlink()
+            artifact = {'id': 1, 'name': 'digest-state-encrypted-prepared-1', 'expired': False,
+                        'workflow_run': {'id': 10, 'head_branch': 'main'}}
+            with patch.object(restore_state.subprocess, 'run') as run:
+                run.side_effect = [Mock(stdout=json.dumps([{'artifacts': [artifact]}]).encode()),
+                                   Mock(stdout=json.dumps(ArtifactRestoreTests.trusted_run()).encode()),
+                                   Mock(stdout=payload.getvalue())]
+                restore_state.restore(self.root, 'owner/repo', 'main')
+            self.assertEqual(json.loads((self.root / 'prepared.json').read_text()), before)
+            with patch.object(digest.smtplib, 'SMTP') as smtp, patch.object(digest, 'fetch_all') as fetch:
+                self.run_main('--send-prepared')
+                self.run_main('--send-prepared')
+                submit = smtp.return_value.__enter__.return_value.send_message
+                self.assertEqual(submit.call_count, 1)
+                self.assertEqual(submit.call_args.args[0]['Message-ID'], before['message_id'])
+                self.assertEqual(submit.call_args.args[0].get_body(preferencelist=('html',)).get_content().strip(), before['html_body'].strip())
+                fetch.assert_not_called()
+
     def test_old_reservation_blocks_next_runner_without_fetching_or_sending(self):
         with patch.dict(os.environ, self.env, clear=True):
             self.prepare()
@@ -117,6 +146,12 @@ class PreparedWorkflowTests(unittest.TestCase):
 
 
 class ArtifactRestoreTests(unittest.TestCase):
+    def setUp(self):
+        from cryptography.fernet import Fernet
+        env = patch.dict(os.environ, {'DIGEST_STATE_KEY': Fernet.generate_key().decode()})
+        env.start()
+        self.addCleanup(env.stop)
+
     @staticmethod
     def trusted_run(**changes):
         run = dict(path='.github/workflows/daily-digest.yml', event='schedule', head_branch='main',
@@ -144,7 +179,7 @@ class ArtifactRestoreTests(unittest.TestCase):
             with self.subTest(changes=changes), tempfile.TemporaryDirectory() as tmp, patch.object(restore_state.subprocess, 'run') as run:
                 run.side_effect = [Mock(stdout=json.dumps([{'artifacts': [self.artifact()]}]).encode()),
                                    Mock(stdout=json.dumps(self.trusted_run(**changes)).encode())]
-                restore_state.restore(tmp, 'owner/repo', 'main')
+                restore_state.restore(tmp, 'owner/repo', 'main', allow_legacy=True)
                 self.assertEqual(run.call_count, 2)
                 self.assertFalse((Path(tmp) / 'prepared.json').exists())
 
@@ -154,7 +189,7 @@ class ArtifactRestoreTests(unittest.TestCase):
                                Mock(stdout=json.dumps(self.trusted_run(event='pull_request')).encode()),
                                Mock(stdout=json.dumps(self.trusted_run(event='workflow_dispatch', conclusion='failure')).encode()),
                                Mock(stdout=self.archive())]
-            restore_state.restore(tmp, 'owner/repo', 'main')
+            restore_state.restore(tmp, 'owner/repo', 'main', allow_legacy=True)
             self.assertIn('/1/zip', run.call_args.args[0][-1])
             self.assertTrue((Path(tmp) / 'prepared.json').exists())
 
@@ -166,7 +201,7 @@ class ArtifactRestoreTests(unittest.TestCase):
             run.side_effect = [Mock(stdout=json.dumps([{'artifacts': [self.artifact()]}]).encode()),
                                subprocess.CalledProcessError(1, 'gh')]
             with self.assertRaises(subprocess.CalledProcessError):
-                restore_state.restore(tmp, 'owner/repo', 'main')
+                restore_state.restore(tmp, 'owner/repo', 'main', allow_legacy=True)
             self.assertEqual(state.read_text(), '{"existing":true}')
             self.assertEqual(run.call_count, 2)
 
@@ -174,7 +209,7 @@ class ArtifactRestoreTests(unittest.TestCase):
         for run_id in [None, True, '../other', 0]:
             with self.subTest(run_id=run_id), tempfile.TemporaryDirectory() as tmp, patch.object(restore_state.subprocess, 'run') as run:
                 run.return_value = Mock(stdout=json.dumps([{'artifacts': [self.artifact(run_id=run_id)]}]).encode())
-                restore_state.restore(tmp, 'owner/repo', 'main')
+                restore_state.restore(tmp, 'owner/repo', 'main', allow_legacy=True)
                 self.assertEqual(run.call_count, 1)
 
     def test_restore_uses_latest_matching_branch_and_expected_files(self):
@@ -192,7 +227,7 @@ class ArtifactRestoreTests(unittest.TestCase):
             run.side_effect = [Mock(stdout=json.dumps([{'artifacts': artifacts}]).encode()),
                                Mock(stdout=json.dumps(self.trusted_run()).encode()), Mock(stdout=payload.getvalue())]
             root = Path(tmp) / 'state'
-            restore_state.restore(root, 'owner/repo', 'main')
+            restore_state.restore(root, 'owner/repo', 'main', allow_legacy=True)
             self.assertIn('/2/zip', run.call_args.args[0][-1])
             self.assertTrue((root / 'prepared.json').exists())
             self.assertFalse((Path(tmp) / 'escape.json').exists())
@@ -201,7 +236,7 @@ class ArtifactRestoreTests(unittest.TestCase):
         import subprocess
         with tempfile.TemporaryDirectory() as tmp, patch.object(restore_state.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'gh')):
             with self.assertRaises(subprocess.CalledProcessError):
-                restore_state.restore(tmp, 'owner/repo', 'main')
+                restore_state.restore(tmp, 'owner/repo', 'main', allow_legacy=True)
 
 
 class EvidenceRegressionTests(unittest.TestCase):

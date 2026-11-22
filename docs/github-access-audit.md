@@ -9,7 +9,7 @@
 - Dependabot vulnerability alerts were enabled and verified. Weekly dependency and action update PRs are configured in `.github/dependabot.yml`; updates are not automatically merged.
 - Every workflow checkout disables persisted credentials. Explicit `GH_TOKEN` exposure in the delivery job is limited to the send-window check and artifact restoration, where repository Actions read access is required. Package installation, AI preparation, and SMTP steps do not receive that environment variable. The GitHub platform still supplies implicit action/runtime credentials; this is not a separate security isolation boundary between steps in a job.
 - AI keys and the SMTP password remain separated by preparation/sending step. Push/PR regression tests receive no service secrets.
-- Original prompts and design images are retained. Prepared-edition artifacts remain private repository data and expire after seven days; they include recipient addresses and email content and are readable by credentials with Actions read access.
+- Original prompts and design images are retained. At the original audit, seven-day prepared artifacts contained plaintext recipient/message data. Current uploads use authenticated encryption; complete the [encrypted-state migration and legacy cleanup](encrypted-state.md) before publication. Actions read access alone cannot decrypt the new artifacts without the separate state key.
 
 ## What could not be established or changed
 

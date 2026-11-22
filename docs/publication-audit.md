@@ -1,6 +1,8 @@
 # Public-release audit — November 21, 2026
 
-**Decision: keep the active automation repository private for now.** No visibility setting, secret, remote log, artifact, schedule, or live Google project was changed. A clean public portfolio copy is the least disruptive way to show recruiters the project while retaining private delivery state.
+**Current release gate: keep the repository private until encrypted migration/cleanup and the remaining identity/image decisions are verified.** The subsequent encryption implementation and live verification are recorded in [encrypted-state.md](encrypted-state.md). The findings and counts below describe the original pre-encryption audit snapshot.
+
+**Original audit decision: keep the active automation repository private for now.** No visibility setting, secret, remote log, artifact, schedule, or live Google project was changed. A clean public portfolio copy is the least disruptive way to show recruiters the project while retaining private delivery state.
 
 ## Scope and measured coverage
 
