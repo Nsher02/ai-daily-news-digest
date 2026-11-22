@@ -230,3 +230,6 @@ __marimo__/
 # Local live-verification output
 /groq-full-verification.html
 /groq-full-verification.json
+
+# Encrypted artifact staging; the key never belongs in this checkout
+.digest-artifacts/
