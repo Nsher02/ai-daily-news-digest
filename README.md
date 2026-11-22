@@ -368,6 +368,7 @@ The workflow reads the following repository secrets. The optional Groq key is ex
 
 | Secret | What it is | Where it comes from | Example (placeholder) |
 | --- | --- | --- | --- |
+| `DIGEST_STATE_KEY` | Required artifact-encryption key; keep a secure backup | [Setup and migration](docs/encrypted-state.md) | `<generated-fernet-key>` |
 | `GROQ_API_KEY` | Optional independent backup API key | [Groq Console](https://console.groq.com/keys) | `<your-groq-api-key>` |
 | `LLM_API_KEY` | Gemini API key | [Google AI Studio](https://aistudio.google.com/) → Get API key | `<your-gemini-api-key>` |
 | `SMTP_HOST` | iCloud SMTP server | Apple's iCloud Mail settings | `smtp.mail.me.com` |
@@ -377,7 +378,7 @@ The workflow reads the following repository secrets. The optional Groq key is ex
 | `EMAIL_TO` | Where the digest is delivered | You choose | `<you>@icloud.com` |
 | `EMAIL_FROM` | The iCloud alias the digest is sent from. If empty or missing, the script sends from `SMTP_USER`. | iCloud Mail → Settings → Accounts → add an alias | `<your-alias>@icloud.com` |
 
-If `EMAIL_FROM` is missing the run still works. If any of the required others is missing the run fails (a `KeyError` in the logs), except `SMTP_PORT`, which falls back to 587. Missing `GROQ_API_KEY` simply disables Groq.
+If `EMAIL_FROM` is missing the run still works. If any of the required others is missing the run fails (a `KeyError` in the logs), except `SMTP_PORT`, which falls back to 587. Missing `GROQ_API_KEY` simply disables Groq. A missing or invalid `DIGEST_STATE_KEY` stops restore with a safe configuration error before preparation; configure the key and complete migration instead of resetting state.
 
 **Update a secret:** GitHub repo → **Settings** → **Secrets and variables** → **Actions** → click the secret → **Update secret** → paste the new value → save. The next run uses it; no code change or commit needed.
 
