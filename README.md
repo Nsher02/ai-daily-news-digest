@@ -357,6 +357,8 @@ Follow [CONTRIBUTING.md](CONTRIBUTING.md): use a `codex/` branch and pull reques
 
 ## GitHub access and permissions
 
+**Before making this repository public:** read the [public-release audit](docs/publication-audit.md). The active delivery-state artifacts contain personal email addresses and prepared messages; publishing source does not keep those artifacts private. Artifact-origin checks are hardened, but storage privacy and historical author-email/image-sharing decisions still need resolution. The repository remains private.
+
 The [GitHub access audit and manual token checklist](docs/github-access-audit.md) records the live repository settings and their limitations. Actions are restricted to the allowlisted action repositories with full SHA pins required. Checkouts do not persist credentials, and explicit workflow GitHub-token exposure is limited to send-window checking and state restoration. Dependabot alerts and weekly reviewable update PRs help maintain dependencies. The cron-job.org scheduler and Google monitor need separate, one-repository tokens with Actions write and Actions read access respectively; neither token belongs in the repository.
 
 ## Secrets

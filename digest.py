@@ -243,7 +243,7 @@ def fetch_feed(feed, settings, cutoff):
                 items.extend({**item, **story, "image": ""} for story in expanded)
                 continue
             except Exception as e:
-                log.warning("%s: could not expand issue; keeping issue-level fallback (%s)", feed["name"], e)
+                log.warning("%s: could not expand issue; keeping issue-level fallback (%s)", feed["name"], describe_error(e))
         items.append(item)
     if undated:
         log.warning("%s: skipped %d undated entries", feed["name"], undated)
@@ -260,7 +260,7 @@ def fetch_all(config):
         try:
             results[feed["name"]] = fetch_feed(feed, settings, cutoff)
         except Exception as e:
-            log.error("%s: failed, skipping (%s)", feed["name"], e)
+            log.error("%s: failed, skipping (%s)", feed["name"], describe_error(e))
     return results
 
 
@@ -661,11 +661,10 @@ def parse_digest(content, items, settings=None):
 
 
 def describe_error(e):
-    """Status code and message of an LLM failure, for the Actions log."""
+    """Safe diagnostics: provider bodies/messages can contain private request data."""
     if isinstance(e, openai.APIStatusError):
-        detail = json.dumps(e.body)[:500] if e.body else e.message
-        return f"HTTP {e.status_code} {type(e).__name__}: {detail}"
-    return f"{type(e).__name__}: {e}"
+        return f"HTTP {e.status_code} {type(e).__name__}"
+    return type(e).__name__
 
 
 def run_llm_chain(prompt, parse, settings, deadline, label, final_try=True, count=None, want=0, accept_short=None, on_attempt=None, on_response=None, groq_prompt=None, groq_budget=None, groq_runner=None):
