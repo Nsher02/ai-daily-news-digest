@@ -117,19 +117,80 @@ class PreparedWorkflowTests(unittest.TestCase):
 
 
 class ArtifactRestoreTests(unittest.TestCase):
+    @staticmethod
+    def trusted_run(**changes):
+        run = dict(path='.github/workflows/daily-digest.yml', event='schedule', head_branch='main',
+                   repository={'full_name': 'owner/repo'}, head_repository={'full_name': 'owner/repo'})
+        return dict(run, **changes)
+
+    @staticmethod
+    def artifact(artifact_id=1, run_id=10):
+        return dict(id=artifact_id, name='digest-state-final-fixture', expired=False,
+                    workflow_run=dict(id=run_id, head_branch='main'))
+
+    @staticmethod
+    def archive():
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, 'w') as archive:
+            archive.writestr('prepared.json', '{"delivery_status":"prepared"}')
+        return payload.getvalue()
+
+    def test_restore_rejects_untrusted_runs_before_downloading(self):
+        for changes in [dict(event='pull_request'), dict(event='pull_request_target'),
+                        dict(path='.github/workflows/tests.yml'), dict(head_branch='feature'),
+                        dict(repository={'full_name': 'other/repo'}),
+                        dict(head_repository={'full_name': 'attacker/repo'}),
+                        dict(head_repository=None)]:
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as tmp, patch.object(restore_state.subprocess, 'run') as run:
+                run.side_effect = [Mock(stdout=json.dumps([{'artifacts': [self.artifact()]}]).encode()),
+                                   Mock(stdout=json.dumps(self.trusted_run(**changes)).encode())]
+                restore_state.restore(tmp, 'owner/repo', 'main')
+                self.assertEqual(run.call_count, 2)
+                self.assertFalse((Path(tmp) / 'prepared.json').exists())
+
+    def test_restore_skips_forged_newest_artifact_and_accepts_failed_delivery_run(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(restore_state.subprocess, 'run') as run:
+            run.side_effect = [Mock(stdout=json.dumps([{'artifacts': [self.artifact(2, 20), self.artifact()]}]).encode()),
+                               Mock(stdout=json.dumps(self.trusted_run(event='pull_request')).encode()),
+                               Mock(stdout=json.dumps(self.trusted_run(event='workflow_dispatch', conclusion='failure')).encode()),
+                               Mock(stdout=self.archive())]
+            restore_state.restore(tmp, 'owner/repo', 'main')
+            self.assertIn('/1/zip', run.call_args.args[0][-1])
+            self.assertTrue((Path(tmp) / 'prepared.json').exists())
+
+    def test_run_lookup_failure_never_downloads_or_overwrites_existing_state(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp, patch.object(restore_state.subprocess, 'run') as run:
+            state = Path(tmp) / 'prepared.json'
+            state.write_text('{"existing":true}')
+            run.side_effect = [Mock(stdout=json.dumps([{'artifacts': [self.artifact()]}]).encode()),
+                               subprocess.CalledProcessError(1, 'gh')]
+            with self.assertRaises(subprocess.CalledProcessError):
+                restore_state.restore(tmp, 'owner/repo', 'main')
+            self.assertEqual(state.read_text(), '{"existing":true}')
+            self.assertEqual(run.call_count, 2)
+
+    def test_missing_run_id_is_not_used_as_an_api_path(self):
+        for run_id in [None, True, '../other', 0]:
+            with self.subTest(run_id=run_id), tempfile.TemporaryDirectory() as tmp, patch.object(restore_state.subprocess, 'run') as run:
+                run.return_value = Mock(stdout=json.dumps([{'artifacts': [self.artifact(run_id=run_id)]}]).encode())
+                restore_state.restore(tmp, 'owner/repo', 'main')
+                self.assertEqual(run.call_count, 1)
+
     def test_restore_uses_latest_matching_branch_and_expected_files(self):
         payload = io.BytesIO()
         with zipfile.ZipFile(payload, 'w') as archive:
             archive.writestr('prepared.json', json.dumps({'delivery_status': 'prepared'}))
             archive.writestr('history.json', '[]')
             archive.writestr('../escape.json', '{}')
-        artifacts = [{'id': i, 'name': name, 'expired': expired, 'workflow_run': {'head_branch': branch}}
+        artifacts = [{'id': i, 'name': name, 'expired': expired, 'workflow_run': {'id': 10, 'head_branch': branch}}
                      for i, name, expired, branch in [(1, 'digest-state-prepared-1', False, 'main'),
                                                       (2, 'digest-state-final-1', False, 'main'),
                                                       (3, 'digest-state-final-2', False, 'feature'),
                                                       (4, 'digest-state-final-3', True, 'main')]]
         with tempfile.TemporaryDirectory() as tmp, patch.object(restore_state.subprocess, 'run') as run:
-            run.side_effect = [Mock(stdout=json.dumps([{'artifacts': artifacts}]).encode()), Mock(stdout=payload.getvalue())]
+            run.side_effect = [Mock(stdout=json.dumps([{'artifacts': artifacts}]).encode()),
+                               Mock(stdout=json.dumps(self.trusted_run()).encode()), Mock(stdout=payload.getvalue())]
             root = Path(tmp) / 'state'
             restore_state.restore(root, 'owner/repo', 'main')
             self.assertIn('/2/zip', run.call_args.args[0][-1])
@@ -191,3 +252,32 @@ class CorruptStatePreviewTests(unittest.TestCase):
                 send.assert_not_called()
             self.assertIn('Good Morning', output.read_text())
             self.assertEqual(prepared.read_text(), '{bad json')
+
+
+class PrivateErrorLoggingTests(unittest.TestCase):
+    def test_provider_status_error_never_formats_body_or_message(self):
+        class ProviderStatusError(Exception):
+            status_code = 429
+            body = {'error': 'private-fixture-body', 'quota': 'PerDay'}
+
+            @property
+            def message(self):
+                raise AssertionError('private provider message was accessed')
+
+            def __str__(self):
+                raise AssertionError('private provider error was formatted')
+
+        error = ProviderStatusError()
+        with patch.object(digest.openai, 'APIStatusError', ProviderStatusError):
+            self.assertEqual(digest.describe_error(error), 'HTTP 429 ProviderStatusError')
+        self.assertEqual(error.body['quota'], 'PerDay')  # Retry decisions retain the original exception.
+
+    def test_arbitrary_exception_text_is_never_formatted(self):
+        self.assertEqual(digest.describe_error(ValueError('private-fixture-message')), 'ValueError')
+
+    def test_feed_exception_log_does_not_expose_its_message(self):
+        settings = digest.load_config()['settings']
+        with patch.object(digest, 'fetch_feed', side_effect=RuntimeError('private-fixture-message')), self.assertLogs(digest.log, level='ERROR') as logs:
+            self.assertEqual(digest.fetch_all({'settings': settings, 'feeds': [{'name':'Fixture'}]}), {})
+        self.assertNotIn('private-fixture-message', '\n'.join(logs.output))
+        self.assertIn('RuntimeError', '\n'.join(logs.output))
