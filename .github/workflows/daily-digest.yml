@@ -64,6 +64,7 @@ jobs:
         run: python restore_state.py
         env:
           GH_TOKEN: ${{ github.token }}
+          DIGEST_STATE_KEY: ${{ secrets.DIGEST_STATE_KEY }}
 
       - name: Prepare digest
         id: prepare
@@ -81,18 +82,24 @@ jobs:
 
       # Persist the reserved edition before SMTP. Another attempt treats an unfinished
       # reservation as ambiguous instead of sending a potentially duplicate edition.
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Encrypt prepared state
+        id: seal_prepared
         if: steps.prepare.outputs.outcome == 'prepared'
+        run: python state_crypto.py --output .digest-artifacts/prepared/state.enc
+        env:
+          DIGEST_STATE_KEY: ${{ secrets.DIGEST_STATE_KEY }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.prepare.outputs.outcome == 'prepared' && steps.seal_prepared.outcome == 'success'
         with:
-          name: digest-state-prepared-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .digest-state/*.json
-          include-hidden-files: true
+          name: digest-state-encrypted-prepared-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .digest-artifacts/prepared/state.enc
           if-no-files-found: error
           retention-days: 7
 
       - name: Send prepared digest
         id: build
-        if: steps.prepare.outputs.outcome == 'prepared'
+        if: steps.prepare.outputs.outcome == 'prepared' && steps.seal_prepared.outcome == 'success'
         run: python digest.py --send-prepared
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -102,12 +109,18 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Encrypt final state
+        id: seal_final
         if: always() && steps.prepare.outputs.outcome == 'prepared'
+        run: python state_crypto.py --output .digest-artifacts/final/state.enc
+        env:
+          DIGEST_STATE_KEY: ${{ secrets.DIGEST_STATE_KEY }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always() && steps.seal_final.outcome == 'success'
         with:
-          name: digest-state-final-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .digest-state/*.json
-          include-hidden-files: true
+          name: digest-state-encrypted-final-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .digest-artifacts/final/state.enc
           if-no-files-found: error
           retention-days: 7
 
