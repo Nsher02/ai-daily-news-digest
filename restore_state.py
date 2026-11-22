@@ -8,6 +8,7 @@ import zipfile
 from pathlib import Path
 
 STATE_FILES = {"history.json", "prepared.json", "quality.json"}
+DELIVERY_WORKFLOW = ".github/workflows/daily-digest.yml"
 
 
 def restore(directory, repo, branch):
@@ -23,7 +24,33 @@ def restore(directory, repo, branch):
     if not artifacts:
         print("No previous digest state artifact. Starting with empty history.")
         return
-    latest = max(artifacts, key=lambda artifact: artifact["id"])
+    latest = None
+    checked_runs = {}
+    for artifact in sorted(artifacts, key=lambda artifact: artifact["id"], reverse=True):
+        run_id = artifact.get("workflow_run", {}).get("id")
+        if type(run_id) is not int or run_id <= 0:
+            continue
+        if run_id not in checked_runs:
+            # Branch names and artifact names can be chosen by fork PRs. Verify
+            # the authoritative run before trusting any recovered email content.
+            run_response = subprocess.run(
+                ["gh", "api", f"repos/{repo}/actions/runs/{run_id}"],
+                check=True, capture_output=True,
+            )
+            run = json.loads(run_response.stdout)
+            checked_runs[run_id] = (
+                run.get("path") == DELIVERY_WORKFLOW
+                and run.get("event") in {"schedule", "workflow_dispatch"}
+                and run.get("head_branch") == branch
+                and (run.get("repository") or {}).get("full_name") == repo
+                and (run.get("head_repository") or {}).get("full_name") == repo
+            )
+        if checked_runs[run_id]:
+            latest = artifact
+            break
+    if latest is None:
+        print("No trusted delivery state artifact. Starting with empty history.")
+        return
     response = subprocess.run(
         ["gh", "api", f"repos/{repo}/actions/artifacts/{latest['id']}/zip"],
         check=True, capture_output=True,
