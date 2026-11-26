@@ -1,530 +1,160 @@
-# ai-daily-news-digest
+# AI Daily News Digest
 
-A personal daily email digest of AI news, delivered to an iCloud inbox every morning. A single Python script pulls 13 RSS feeds, asks Google Gemini to pick the most important stories, reads each story's full article, has Gemini write a paragraph-length summary of each, and sends a news-app-style HTML email (with article images, light and dark mode) through iCloud SMTP. GitHub Actions runs it every morning, triggered by cron-job.org with GitHub's own cron as a backup, so nothing needs to stay running on your machine.
+A daily AI news briefing that collects RSS stories, selects the most important developments, writes source-grounded summaries, and delivers an HTML email with a plain-text alternative. It runs on GitHub Actions, uses Gemini with a Groq backup, and sends through iCloud SMTP. No always-on computer, website, or custom domain is required.
 
----
+This public repository contains the working application, tests, implementation prompts, and design references. Production credentials are stored in GitHub Actions secrets; saved delivery state is encrypted before upload. This repository remains the production project—there is no separate public-copy deployment.
+
+## What the digest provides
+
+- **A focused briefing:** selects 10–15 stories when enough relevant, distinct candidates are available, grouped into sections with source links.
+- **Article-based summaries:** targets 4–6 sentences and roughly 90–160 words for stories with sufficient accessible evidence. Limited-source stories receive shorter summaries.
+- **A topical email subject:** summarizes the day's major topics instead of using only a fixed newsletter title.
+- **Readable email design:** a table-based layout with images, black and gray tones, a top gradient, disclosure/footer styling, and a plain-text version. Rendering varies by email client.
+- **Resilience:** alternate models, bounded retries, saved prepared editions, encrypted recovery state, and duplicate-send checks.
+- **Independent monitoring:** an optional hourly Google Apps Script monitor checks whether GitHub recorded SMTP acceptance.
+
+The styling is inspired by the Apple News email references in [`design/`](design/). This is an independent personal project, not an Apple product.
 
 ## How it works
 
-Everything lives in `digest.py`; `main()` runs these steps in order.
-
-| # | Step | Function | What happens |
-| --- | --- | --- | --- |
-| 1 | Fetch | `fetch_all` / `fetch_feed` | Downloads each feed in `config.yaml` with `requests` (timeout `request_timeout`, browser-like `user_agent`) and parses it with `feedparser`. Google News titles lose their ` - Publisher` suffix and the publisher becomes the source; TLDR AI issues are expanded into individual article items (`fetch_issue_stories`), each with its own headline, snippet and destination link. |
-| 2 | Filter | `fetch_feed` | Keeps items published in the last `lookback_hours`. Items with no date are dropped (logged as a warning). Each feed is sorted newest first and capped at its `max_items`. |
-| 3 | Dedupe | `dedupe` | Groups items matching a **normalized URL** or **normalized title** into one candidate, retaining every source link and the best snippet per publisher. |
-| 4 | Pass 1: pick | `summarize` / `run_llm_chain` | Sends all items to Gemini in one request. The model picks `min_stories`–`max_stories` stories (10–15), merges duplicates, ranks multi-source stories higher, sorts them into sections, and returns JSON with short summaries. |
-| 5 | Read articles | `enrich_story` | For each picked story, in parallel (10 workers): resolves Google News redirect links to the publisher's URL (`decode_google_news`), fetches the article page (`article_timeout`, 10s) and extracts the main text with **trafilatura**, trimmed to `article_chars` (4,000). Also picks the story's image (see [Email design](#email-design)). |
-| 6 | Pass 2: write | `build_summary_prompt` / `run_llm_chain` | **One** batched Gemini request writes a 4–6 sentence paragraph per story (what happened, key details and numbers, why it matters) using only the fetched article text and feed snippets. Stories whose article couldn't be fetched get 1–3 sentences from the snippets only. |
-| 7 | Render | `render_html` / `render_text` | Builds the email-safe HTML (table layout, inline CSS, dark-mode styles) plus a plain-text alternative. |
-| 8 | Send | `send_email` | Connects to `SMTP_HOST:SMTP_PORT`, upgrades with STARTTLS, logs in as `SMTP_USER`, sends from `EMAIL_FROM`. |
-
-**Normalization used by dedupe:**
-- URL: lowercase scheme and host, strip `www.`, drop `utm_*` query params, the `#fragment` and a trailing `/`. Other query params are kept (so `?id=1` and `?id=2` stay distinct).
-- Title: lowercase, curly quotes → straight, punctuation removed, whitespace collapsed.
-
-Grouping includes transitive URL/title matches and preserves original evidence. Distinct publishers are counted once even when also found through Google News. This only catches *exact* duplicates. The same story covered by two outlets with different headlines gets through dedupe, and the LLM merges it in pass 1. The prompt treats a story covered by several sources as a strong signal of importance: it ranks higher and lists every source. It also prioritizes major model releases, big company and lab news, funding and policy over minor product updates.
-
-### Cross-day story history
-
-Scheduled GitHub runs restore accepted story history from the latest non-expired `digest-state-*` artifact for their branch. The workflow sets `DIGEST_HISTORY_PATH` to `.digest-state/history.json`. Local runs can set that variable or `settings.story_history_path` explicitly, otherwise local history stays disabled. API or archive failures stop restoration visibly rather than silently discarding saved delivery state. Each accepted story record stores the edition date, normalized original/resolved URLs, original and generated titles, and source evidence. Grouped alternate links also participate in matching. The history is retained for `settings.story_history_hours` (default 72) and capped by `settings.story_history_max_entries` (default 500); stale or malformed entries are ignored during restore.
-
-The history filter runs only for scheduled runs. Manual runs (`workflow_dispatch` with `trigger=manual`) keep their ability to send immediately even if a recent digest already covered the same item. Dry runs, replayed snapshots, failed sends, and discarded candidates never advance the accepted-history file. Writes are atomic (`.tmp` + `os.replace`) so a crash does not leave a half-written JSON file.
-
-The guard is intentionally conservative: it suppresses only exact normalized URL matches or exact normalized title matches within the retention window. It does not do broad keyword matching, and it never fills a quiet day by reintroducing old stories. The remaining candidate list is used for both the AI-selection pass and the raw-headlines fallback, so the history rule is consistent across edition styles.
-
-### The ID-mapping design (why links can't be invented)
-
-Each item goes into the prompt as `[id] (source) title` plus a snippet. The model is told to return only item **IDs**, never URLs:
-
-```json
-{"tldr": "...", "excluded_ids": [], "sections": [{"name": "...", "stories": [{"ids": [3, 17], "headline": "...", "summary": "..."}]}]}
+```mermaid
+flowchart LR
+    A[RSS feeds] --> B[Filter and group stories]
+    B --> C[Select stories with AI]
+    C --> D[Retrieve public article text]
+    D --> E[Write and validate summaries]
+    E --> F[Save encrypted edition]
+    F --> G[Send through iCloud SMTP]
 ```
 
-The code maps each group ID back to its original feed evidence and source links. IDs must be integers in range (booleans are rejected). Repeated IDs within a story are collapsed; stories reusing an already selected ID or normalized headline are skipped. Headlines and summaries must be nonempty strings. Unknown sections are discarded, duplicate section blocks are combined, sections follow the configured editorial order, and the selected digest is capped at `max_stories`. A response with no usable stories fails validation. The raw-headlines emergency fallback retains its existing all-items behavior.
+1. **Collect:** read the 13 feeds in [`config.yaml`](config.yaml), including publisher feeds, lab blogs, Google News, Hacker News, and TLDR AI. TLDR issue pages are expanded into individual stories. The configured lookback is 26 hours.
+2. **Filter duplicates:** group normalized URL/title matches while preserving source evidence and alternate links. Scheduled editions also compare against accepted story history, retained for 72 hours and bounded to 500 entries by default. Different headlines about the same event may still require the model to merge them.
+3. **Select:** the first AI pass ranks candidates, groups related coverage, and returns structured sections and short summaries. Story IDs map back to collected links; model-generated links are not trusted as article destinations.
+4. **Retrieve evidence:** resolve supported Google News redirects and extract accessible article text with `trafilatura`. The configured evidence cap is 4,000 characters per article. Login, paywall, and bot-challenge pages are treated as unavailable evidence; the application does not bypass them.
+5. **Write:** a second AI pass expands the selected stories using article text and feed snippets. Gemini and Groq share the editorial instructions, grounding constraints, link/ID checks, and paragraph validation. Groq can split the work into paced batches to fit its request budget.
+6. **Persist and send:** save the prepared subject, bodies, and delivery metadata, encrypt a recovery artifact, then submit the email through SMTP with STARTTLS. Save encrypted final state and record an SMTP-acceptance receipt after a successful submission.
 
-A merged story keeps original source links. Its headline links to the article that pass 2 actually read (falling back to the first direct link), with other publishers shown as "Also covered by …". Publisher names are compared without case, whitespace or punctuation differences; different aliases for the same publisher are not automatically resolved.
+The main pipeline is in [`digest.py`](digest.py). Scheduling, artifact recovery, and the independent monitor live in separate modules.
 
-### The "(title only)" anti-hallucination rule
+## Models, retries, and limitations
 
-Some feeds carry no real description. Hacker News (hnrss) fills the summary with boilerplate like `Article URL: … Comments URL: … Points: 132 # Comments: 72`. `clean_text` strips HTML tags and that boilerplate (`FEED_BOILERPLATE`) and truncates to 300 characters (or the feed's `snippet_chars`; TLDR AI allows up to 1500 characters per extracted story). Google News summaries only repeat the title, so they're dropped. If nothing is left, the item is sent to the model marked **`(title only)`**.
+The default provider sequence starts with Gemini `gemini-3.5-flash`, then tries `gemini-3.5-flash-lite`, followed by Groq `openai/gpt-oss-120b` when `GROQ_API_KEY` is configured. Bounded primary retries and a final cooldown follow if needed. The model defaults are defined in `digest.py`; local environment overrides and the workflow's optional `GROQ_MODEL` variable are described in the configuration itself.
 
-The prompt tells the model to summarize those items using only what the headline says ("HN discussion of …"), and never to add details, causes, numbers or quotes that aren't in the title or snippet. Temperature is `0.2` to keep output conservative.
+Current settings allow 60 seconds per model request, a 2-second primary retry backoff, a 15-second final wait, and a 900-second supervised LLM stage cap. The GitHub delivery job has a 20-minute overall timeout. Groq batches share a local token budget and pacing window; provider-wide quotas and usage from other applications can still cause failures.
 
-### Paragraph summaries (pass 2)
+If selection or rewriting fails, the application can fall back to shorter AI summaries or raw headlines. It labels summary quality in run metadata rather than treating every successful workflow as proof of full AI coverage. If there are no usable feed items, it skips the digest. SMTP or state-recovery failures can fail the run.
 
-After pass 1, `enrich_story` prepares each story:
+AI summaries can contain mistakes. Paywalls, unavailable feeds, provider outages, scheduling delays, and mail filtering remain external dependencies. **SMTP acceptance is not proof of inbox delivery or reading.**
 
-- **Google News links** (`news.google.com/rss/articles/…`) don't redirect with a plain GET. `decode_google_news` reads the article's signature from Google's page and asks Google's `batchexecute` endpoint for the real URL, the same way the Google News web app does. If that fails, the story uses a direct link from another source that covered it; a Google News link is only used as a last resort.
-- **Which article is read:** the first direct link (not Google News, not a TLDR issue page); if it fails or has under 300 characters of text, the next one. At most two tries per story.
-- **Paywalls and errors:** `fetch_article` treats clear login-page, subscription-wall, and bot-check signals as `login_required`, `paywall`, or `bot_challenge` instead of trusting a short extraction. A valid public article that mentions a paywall still stays in the digest; when no usable article text is available, the story is marked as unavailable and pass 2 writes a shorter summary from the headline and feed snippets only.
+## Daily schedule and duplicate protection
 
-Pass 2 sends all stories in **one** request containing original feed titles, snippets and article text. Generated pass-1 headlines are omitted from the evidence. Both prompts tell the model to treat source content as data and ignore embedded instructions. The prompt says to use only facts from that text, never names, numbers, dates, quotes or background from the model's own knowledge, and to leave out "why it matters" rather than guess. The model returns final headlines and summaries plus a final TL;DR. Missing or invalid rewrites keep their pass-1 fields. The final TL;DR replaces the first one only when every story has a valid rewrite. Prompt instructions reduce risk but do not prove factual accuracy.
+The intended delivery time is **7:50 AM America/Chicago**:
 
-**Gemini usage:** a normal run makes **2 requests** (pass 1 + pass 2). Pass 2 uses the same retry chain without the final primary attempt and its cooldown, because a pass-1 digest is already a good fallback.
-
-### Failure behavior
-
-Each AI pass tries Gemini primary, then Gemini Lite immediately. With `GROQ_API_KEY` configured, independent Groq fallback follows. Selection retains the bounded two-attempt backup; paragraph rewriting uses batches of at most three stories and retries only missing or insufficient paragraphs. The original story numbers are restored after each batch. Without a Groq key, only Gemini is called. All requests and waits share the stage deadline.
-
-| Situation | What happens | Exit code |
-| --- | --- | --- |
-| One feed fails (timeout, HTTP error, unparseable) | Logged as `ERROR <feed>: failed, skipping`; the run continues with the other feeds. **No retry.** | 0 |
-| No items at all after fetch + dedupe | Logs `no items at all; nothing to send` and **sends nothing**. | 0 |
-| Gemini error (503, 429, timeout, bad JSON, zero usable stories) | Runs the LLM fallback chain below. If every step fails, the email is sent anyway as a **raw-headlines fallback**: every item grouped by source, under a yellow note saying "The AI summary failed today…". | 0 |
-| Pass 2 fails (all attempts) or articles can't be fetched | Logs `paragraph summaries failed, using short summaries`; the email uses pass 1's 1–2 sentence summaries, with resolved links and images. | 0 |
-| Sending the email fails (bad login, SMTP down) | Logs `sending email failed: …` and exits non-zero so the GitHub run shows **red**. The SMTP connection has a 30s timeout. | 1 |
-
-### Delivery observability and provider migration
-
-`send_email` now emits a stable `X-Digest-Edition` header and a standards-compliant `Message-ID` before the SMTP send, then records only the safe metadata in GitHub Actions output: edition ID, message ID, send timestamp, and the current evidence label. The code distinguishes between “prepared,” “SMTP accepted,” “failed,” and “unknown” downstream inbox states. With the current iCloud SMTP transport, the only evidence is SMTP server acceptance; it does not confirm that the recipient inbox received or read the message. The run still works with the existing `SMTP accepted: YYYY-MM-DD` receipt markers in `send_window.py`, and those markers are intentionally used to suppress duplicate sends without claiming final inbox delivery.
-
-The workflow prepares the edition with `--prepare-only`, uploads a state artifact, then uses `--send-prepared` for delivery. A final artifact saves the accepted/failed state and bounded story and quality histories. State artifacts are authenticated-encrypted with the dedicated `DIGEST_STATE_KEY` secret and expire after seven days. See [encrypted-state setup and migration](docs/encrypted-state.md) before the first encrypted run. On retry, the script checks saved state before fetching feeds or calling Gemini, preserving the prepared subject, bodies, sender, recipient, Date, and Message-ID. Deliberate manual runs have separate edition IDs and bypass story-history filtering. Existing send-window receipt rules still apply, including the early-manual-run exception. If the persisted record was already accepted by the SMTP server, the retry path will skip the resend rather than risk a duplicate send; an explicitly rejected or safely prepared record can retry its saved content. Before uploading a pre-send artifact, the workflow reserves it to that run attempt. A later attempt encountering an unfinished reservation or ambiguous SMTP result stops for review instead of automatically resending. This conservative policy can defer an edition that never reached SMTP if the runner dies after reservation. This is not exactly-once delivery: SMTP acceptance, a Message-ID, or GitHub receipts only prove the transport accepted a request, not that the provider deduplicated or that the inbox ultimately delivered it.
-
-When a provider-specific mail backend is chosen later, the same persisted record can carry a provider idempotency key, a retention window, and a payload-hash check to guard retries of the exact same request. That extension remains intentionally deferred until sender migration is authorized. The stored payload is kept minimal and safe, and mismatches are treated as a retry boundary rather than silently mutated state.
-
-**LLM fallback chain** (`run_llm_chain`, used by both passes, all values in `config.yaml`):
-
-1. Primary model (`gemini-3.5-flash`), **60s timeout per request** (`llm_timeout`).
-2. Up to **3 retries** of the primary with exponential backoff of 2s, 4s, 8s (`llm_retries`, `llm_backoff`). Errors 400/401/403/404, and a 429 for the **daily** free-tier quota, skip the remaining retries, since retrying the same model won't help.
-3. The lighter model (`gemini-3.5-flash-lite`) **once**.
-4. Pass 1 only: wait **5 minutes** (`llm_final_wait`), then the primary one last time.
-5. Only then: the raw-headlines fallback email (pass 1) or the short pass-1 summaries (pass 2).
-
-The requested minimum is clamped to the available duplicate groups. A shorter selection is accepted immediately when its selected/merged IDs and `excluded_ids` are disjoint and account for every input group. Otherwise the existing retry chain tries for a fuller selection and keeps the short digest as a fallback. Semantic eligibility and merging remain model judgments; Python validates the accounting, not whether every exclusion was editorially justified. Every failed attempt logs the exact cause, for example `ERROR LLM pass 1 attempt 1 (gemini-3.5-flash) failed after 4s: HTTP 503 InternalServerError: [{"error": {"code": 503, "message": "This model is currently experiencing high demand. …"}}]`.
-
-**Hard cap:** the whole AI stage, including article retrieval and free-tier cooldowns, has a **15-minute** budget (`llm_step_cap: 900`). A parent supervisor enforces the deadline and retains the latest checkpoint. Each completed Groq batch is checkpointed, so later provider failures preserve its paragraphs. If only some rewrites finish, the edition is labeled `partial_pass_2` and other stories retain their first-pass summaries. Sparse or blocked sources still receive shorter, grounded summaries rather than invented detail.
-
-### Email design
-
-The email follows `design/Apple_News_reference.jpeg`: a compact morning briefing with distinct black and gray tones. It retains **AI Daily News Digest** branding and includes no Apple logos or promotional modules.
-
-- **Palette:** charcoal outer canvas `#383838`, near-black reading column `#1c1c1c`, bright headlines `#f5f5f5`, soft gray summaries `#b0b0b0`, muted source names `#a0a0a0`, thin dividers `#484848`, strong rules `#999999`, and pink Top Stories lettering `#ff375f`.
-- **Header fade:** the reading column starts at `#2c2c2e`, passes through `#232324`, and fades into `#1c1c1c` over the first 160px, matching the reference. Inline solid backgrounds remain as fallbacks for clients that do not support gradients.
-- **Header:** small date, compact sans-serif “Good Morning From AI Daily News Digest” masthead, then a serif TL;DR.
-- **Top stories:** text-first bullets with bold serif headlines flowing into gray summaries. There is no large hero image.
-- **Other sections:** uppercase section titles, serif headlines with publisher credits below, square thumbnails on the right when available, and full-width gray summaries.
-- **Disclosure footer:** a full-width `#2c2c2c` gray band sits below the near-black story area, with muted `#b0b0b0` text, 24px top padding, and the same responsive side insets as the content. This replaces the previous inset rule and dark footer.
-- **Readability:** comfortable line heights intentionally avoid the overlapping text visible in the reference. Existing story content, source links, and plain-text email are preserved.
-
-**Email-safe HTML:** presentation tables, a 600px maximum reading column, inline critical colors, `bgcolor` fallbacks, and system fonts. The reference's dark palette is the default in both light and dark system appearances; this replaces the previous adaptive white background. A mobile media query reduces padding, masthead size, and thumbnails. Clients may override colors or fonts, block remote images, or ignore image cropping; browser previews do not guarantee identical rendering in every mail client.
-
-**Offline preview:** run `.venv/bin/python digest.py --replay tests/fixtures/replay.json --output /private/tmp/digest-design-preview.html`. This renders saved content without API calls or sending mail. `digest.html` contains a representative synthetic multi-section design preview, not a live news edition.
-
-**Images:** for each story the first working one of: the feed item's `media:content` / `media:thumbnail` / image enclosure / first `<img>` in its HTML (`feed_image`), then the article's `og:image` (read during the article fetch). Every candidate is checked before use (`image_ok`: https, HTTP 200, `Content-Type: image/*`), and a story with no working image simply has no image block, so the email never shows a broken image box.
-
----
-
-## Project files
-
-| Path | Purpose |
+| Component | Role |
 | --- | --- |
-| `digest.py` | The whole pipeline: fetch, filter, dedupe, pass 1, article fetching, pass 2 (with retry/fallback chain and hard cap), render, send. Also holds the LLM prompt, the section list, the primary and lite model defaults and the API base URL. |
-| `config.yaml` | Feeds and settings you'll edit most often (see [Configuration](#configuration-how-to-edit)). |
-| `requirements.txt` | Pinned dependencies: `feedparser`, `openai`, `python-dotenv`, `PyYAML`, `requests`, `trafilatura` (article text extraction). |
-| `design/` | `Apple_News_reference.jpeg`, the current visual reference; `reference.png` is the older reference. Not used at runtime. |
-| `.github/workflows/daily-digest.yml` | The GitHub Actions workflow: `workflow_dispatch` trigger input (for cron-job.org), backup UTC crons, send-window check, Python setup, secrets → env vars, runs `python digest.py`, emails you if a run fails. |
-| `restore_state.py` | Verifies artifact origin, decrypts and validates the latest branch-specific state; uses `gh` and `cryptography`. |
-| `state_crypto.py` / `state_maintenance.py` | Encrypt state, migrate old artifacts without email, and verify encrypted backups before plaintext cleanup. |
-| `send_window.py` | Decides whether a scheduled run (GitHub cron or `trigger=external-schedule`) sends: inside 7:45–10:00 AM Chicago and nothing sent yet today. Standard library only. |
-| `prompts/` | The step-by-step build prompts used to create this project with Claude Code (`prompt_0_brief.md` … `prompt_11_redesign.md`). History only; nothing reads them at runtime. |
-| `.gitignore` | Standard Python template plus `.env`, `.venv` and `.claude/` (local Claude Code settings, not tracked). Keeps secrets and the virtualenv out of git; `__pycache__/` is ignored too. |
-| `digest.html` | Output of the last `--dry-run`. It's committed, so a dry run will show it as modified in `git status`. |
-| `README.md` | This file. |
+| cron-job.org | Primary daily trigger: dispatches `daily-digest.yml` with `trigger=external-schedule`. |
+| GitHub schedule | Backup UTC firings using `53 12,13,14 * * *` and `23 12,13,14 * * *`. |
+| `send_window.py` | Accepts scheduled runs only between 07:45 and 10:00 Chicago time and checks existing `SMTP accepted: YYYY-MM-DD` receipts. |
+| Workflow concurrency | Serializes delivery runs within this repository. |
 
----
+A plain manual dispatch bypasses the scheduled window. Manual runs started before 07:45 do not block the normal morning edition. Do not trigger manual delivery just to check configuration.
 
-## Schedule
+Before SMTP submission, the workflow reserves the prepared edition and uploads encrypted state. Subsequent recovery checks distinguish accepted, rejected, and ambiguous attempts. Ambiguous submissions stop for review instead of automatically risking a duplicate. These measures reduce duplicate sends; they do not provide an exactly-once guarantee across SMTP and GitHub outages.
 
-The digest goes out at about **7:50 AM Chicago time** every morning. GitHub's built-in cron proved unreliable here (one run 4.5 hours late, then several missed firings), so an **external scheduler is the main trigger** and GitHub's cron is only a backup:
+## Security and saved state
 
-| Trigger | When | Run name in Actions |
-| --- | --- | --- |
-| **cron-job.org** (main) calls GitHub's `workflow_dispatch` API with `trigger=external-schedule` | 7:50 AM America/Chicago | `AI Daily News Digest (external-schedule)` |
-| **GitHub cron** (backup), plain UTC: `53 12,13,14 * * *` and `23 12,13,14 * * *` | Six firings, 12:23 to 14:53 UTC. CDT (UTC-5) lands them at 7:23 to 9:53 AM, CST (UTC-6) at 6:23 to 8:53 AM | `AI Daily News Digest (github-cron)` |
-| **You**, Actions → Run workflow (trigger `manual`) | Whenever | `AI Daily News Digest (manual)` |
+- **Credentials:** API keys, SMTP credentials, recipient/sender addresses, and `DIGEST_STATE_KEY` belong in Actions secrets or a private local `.env`, never in tracked files, PRs, screenshots, or logs.
+- **Encrypted artifacts:** `state_crypto.py` uses authenticated Fernet encryption. Uploaded delivery-state archives contain only `state.enc`; recovery checks repository, branch, purpose, producing workflow/event, and the permitted file inventory before restoring anything.
+- **Retention:** delivery-state artifacts expire after seven days. Keep the encryption key backed up in a password manager; losing it prevents recovery of those artifacts. See [`docs/encrypted-state.md`](docs/encrypted-state.md).
+- **Workflow access:** actions use full commit pins, checkout credentials are not persisted, and workflow tokens have explicit read permissions. Push/PR regression tests receive no AI or SMTP secrets.
+- **Repository protections:** `main` requires PRs, current **Offline regression tests**, an up-to-date branch, and resolved review conversations. The rule applies to administrators; force pushes and branch deletion are blocked.
+- **Public contributions:** outside contributors' workflows require approval. Secret scanning, push protection, Dependabot alerts/security updates, and private vulnerability reporting are enabled in repository settings. These settings are configured separately from the source code.
 
-The first step, **Check send window** ([`send_window.py`](send_window.py)), applies to cron runs and `external-schedule` runs and guarantees **at most one scheduled email per day**:
+A public repository exposes tracked files, commit metadata, PRs, and Actions logs. Encryption protects the saved artifact payloads; it does not make the entire repository private or eliminate supply-chain risk. Review workflow and dependency changes before merging, even when tests pass. Do not include private information in a public issue; use the repository's private vulnerability-reporting option for security reports.
 
-- The current America/Chicago time must be between **7:45 and 10:00 AM**. Otherwise the run logs `Skipping: … outside the 07:45-10:00 Chicago send window` and stops. This is how DST is handled. The workflow doesn't use GitHub's cron `timezone:` field.
-- **Nothing may have been sent yet today** (Chicago date). A run counts as sent only if it has a successful `SMTP accepted: YYYY-MM-DD` step for today, and only `send_email` returning successfully produces that step. Scheduled and manual sends both count, **except manual runs started before 7:45 AM**, so an early test run doesn't block the morning email. Empty feeds, dry runs, failed sends and skipped runs never count.
-- **Plain manual runs** (trigger `manual`, the default) skip the check and always send.
+Historical audit documents under [`docs/`](docs/) record earlier snapshots and may describe settings that have since changed. They are not a guarantee that every future change is safe.
 
-On a normal day, the 7:50 external run sends and every GitHub cron firing skips. If cron-job.org fails, the first GitHub cron firing inside the window sends instead.
+## Configure your own installation
 
-Run and job listings are paginated. If the GitHub API call fails, the step fails instead of risking a duplicate, and the failure alert below fires. Concurrency serializes runs, so a run that starts while another is in progress waits for it, then sees its receipt. The script exposes `sent`, `no_items`, `failed`, or `dry_run` through Actions outputs.
+Use your own repository and accounts. Cloning this project does not copy its GitHub secrets, repository policies, external scheduler, or live Google monitor.
 
-SMTP acceptance does not prove inbox delivery. Reserved pre-send state reduces duplicate risk across runner crashes by holding ambiguous editions for review. SMTP offers no atomic transaction with GitHub run metadata. If state artifacts expire or are deleted, the next run starts without that history, and exactly-once delivery cannot be guaranteed.
+1. Configure a Python 3.13 environment and install [`requirements.txt`](requirements.txt).
+2. Add the secrets below under **Settings → Secrets and variables → Actions**. Keep secure copies outside GitHub because saved secret values cannot be displayed again.
+3. Configure action permissions and branch protection as described above and in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+4. Set up the cron-job.org dispatch and, optionally, the Google monitor. Use separate repository-scoped tokens: **Actions read/write** for the scheduler and **Actions read-only** for the monitor.
+5. Review feeds, editorial settings, and display names in `config.yaml`. Configure state encryption before enabling delivery. Migrating an existing installation requires preserving and authenticating its saved state; do not reset it to force a resend.
 
-**Failure alert:** if any step fails, a final step emails you "AI Daily News Digest failed – check GitHub Actions" with a link to the run, using the same SMTP secrets. If the SMTP secrets themselves are broken, only GitHub's own failure notification reaches you. cron-job.org separately emails you if its call to GitHub fails (for example, an expired token).
+| Secret | Purpose |
+| --- | --- |
+| `LLM_API_KEY` | Gemini API access. |
+| `GROQ_API_KEY` | Optional Groq backup API access. |
+| `SMTP_HOST` | SMTP server; this installation uses `smtp.mail.me.com`. |
+| `SMTP_PORT` | STARTTLS port, normally `587`. |
+| `SMTP_USER` | SMTP login account. |
+| `SMTP_PASSWORD` | Apple app-specific password, not the Apple account password. |
+| `EMAIL_TO` | Recipient inbox. |
+| `EMAIL_FROM` | Authorized sender address/alias; falls back to `SMTP_USER` when unset. |
+| `DIGEST_STATE_KEY` | Fernet artifact-encryption key. |
+
+Provider free tiers and limits can change. The implementation includes retries and pacing, but does not guarantee zero cost or unlimited quota for every account. Public repositories can also have scheduled workflows disabled after prolonged inactivity; check workflow status as part of maintenance.
+
+### External scheduler
+
+Configure cron-job.org for 07:50 in `America/Chicago`, with an HTTP **POST** to:
+
+```text
+https://api.github.com/repos/YOUR_OWNER/YOUR_REPO/actions/workflows/daily-digest.yml/dispatches
+```
+
+Use `Authorization: Bearer <scheduler-token>`, `Accept: application/vnd.github+json`, and `Content-Type: application/json`, with this body:
+
+```json
+{"ref":"main","inputs":{"trigger":"external-schedule"}}
+```
+
+Never commit the real token. This is a live delivery trigger, not a harmless connectivity test.
 
 ### Independent missing-digest monitor
 
-The standalone [Google Apps Script monitor](monitoring/README.md) checks the private repository outside GitHub Actions and emails an alert for a missing SMTP receipt or failed verification. Its source and explicit permissions manifest are backed up under `monitoring/`; credentials stay in Google Script properties. Follow the guide to install or update the live Google project and maintain its token and trigger. Pushing this repository does not update that project automatically.
+The optional [`monitoring/`](monitoring/) Google Apps Script project runs hourly and checks the day's SMTP receipt at the first eligible execution after **10:20 Chicago time**. It can alert when no receipt exists or verification fails. It does not inspect your inbox, improve summaries, or resend the digest.
 
-### Inactive degraded-quality monitor design
+The live project needs its own private Script properties and trigger; repository pushes do not deploy it. Follow [`monitoring/README.md`](monitoring/README.md). `inspectDigest` is a read-only diagnostic. `checkDigest` can send real alerts and should not be run manually during an offline verification. The separate degraded-quality notification helper remains disabled in the current configuration.
 
-The repo includes an inactive monitoring design for the cases the current workflow does not actively watch: a missing edition after the 10:00 AM Chicago cutoff, and repeated degraded editions such as a raw-headline fallback or partial-summary pass. The settings in `config.yaml` are intentionally off by default:
+## Develop and test without sending email
 
-- `settings.digest_monitor_enabled: false`
-- `settings.digest_monitor_quality_threshold: 2`
-- `settings.digest_monitor_notification_channel: "disabled"`
-
-The monitoring logic lives in [`send_window.py`](send_window.py) and provides stable alert IDs and a deduplication helper for a future monitor. An activated monitor must persist its seen-alert IDs. Accepted edition quality is saved in `.digest-state/quality.json` (up to 30 entries) for later evaluation. It evaluates the expected daily receipt, checks workflow status for an in-flight run, and reports degraded-quality streaks. Pending runs are diagnostic state and do not produce actionable missing-digest alerts. It does not write or post anything until an external monitor is activated with reviewable credentials and an explicit destination.
-
-This Python monitoring helper is intentionally not enabled in production. The independent Google monitor above is configured separately. A GitHub-only monitor cannot detect the case where GitHub itself never starts the scheduled workflow, and the current SMTP failure email uses the same transport as the digest itself. That dependency is explicit in the code and documentation so a separately authorized notification channel can be chosen later for transport failures. Activating the Python helper would require its own persisted alert state, trigger, and notification destination.
-
-### External trigger setup (cron-job.org)
-
-The token lives **only in cron-job.org**. Never put it in the repo, this README or `.env`.
-
-1. **Token:** GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → Generate new token. Expiration: 90 days (or another deliberately chosen finite lifetime). Repository access: **Only select repositories** → `ai-daily-news-digest`. Repository permissions: **Actions: Read and write** (GitHub adds Metadata: Read-only automatically). Nothing else. **Add a calendar reminder a week before it expires**, because the main trigger stops working when it does (the GitHub cron backup keeps running).
-2. **Job:** cron-job.org → Create cronjob, daily at **7:50**, time zone **America/Chicago**, with this request:
-
-   ```
-   POST https://api.github.com/repos/Nsher02/ai-daily-news-digest/actions/workflows/daily-digest.yml/dispatches
-   Accept: application/vnd.github+json
-   Authorization: Bearer <token>
-   X-GitHub-Api-Version: 2022-11-28
-   Content-Type: application/json
-
-   {"ref":"main","inputs":{"trigger":"external-schedule"}}
-   ```
-
-   Turn on its notifications for failed executions. GitHub answers a successful dispatch with HTTP 204 (no body).
-3. **Test:** use the job's test-run button, then check `gh run list --workflow daily-digest.yml -L 3`. A run named `AI Daily News Digest (external-schedule)` should appear. Outside 7:45–10:00 AM it logs `Skipping: … outside the … send window` and sends nothing.
-
-**To rotate the token:** create a replacement with the same narrow permissions, update the cron-job.org Authorization header, and verify before revoking the old token. The Test/Run button can send a real digest; for a no-email review follow the [safe verification steps](docs/github-access-audit.md).
-
-**To change the time or time zone**, edit four places:
-
-1. cron-job.org: the job's time and time zone.
-2. `.github/workflows/daily-digest.yml`: the UTC backup crons. Pick hours that cover your target local time in both standard and daylight time.
-3. `send_window.py`: `TZ`, `WINDOW_START` and `WINDOW_END`.
-4. `config.yaml`: `settings.timezone` (used for the date in the email heading, and in the receipt step's name).
-
-**GitHub cron runs can start late.** GitHub queues scheduled runs, and they often start minutes or hours after the cron time, or never. That's why it's only the backup. Scheduled runs only fire from the default branch (`main`).
-
-**Manual run:** GitHub → **Actions** → **AI Daily News Digest** → **Run workflow** → branch `main`, trigger `manual` → **Run workflow**. This sends a real email.
-
-The job runs on `ubuntu-latest` with Python 3.13, caches pip, and has a **20-minute** timeout (`timeout-minutes: 20`), comfortably above the 10-minute LLM cap.
-
----
-
-## Configuration (how to edit)
-
-### `config.yaml` reference
-
-| Key | Current value | Controls |
-| --- | --- | --- |
-| `settings.lookback_hours` | `26` | How far back to keep items. 26 rather than 24 gives slack for late runs and odd feed timestamps. |
-| `settings.timezone` | `America/Chicago` | Time zone for the date in the email heading. Does **not** control when the workflow runs. |
-| `settings.request_timeout` | `20` | Seconds per feed request. |
-| `settings.article_timeout` | `10` | Seconds per article page, Google News link decode and image check (pass 2 prep). |
-| `settings.article_chars` | `4000` | Article text sent to the LLM per story. |
-| `settings.min_stories` | `10` | Minimum stories in the email whenever enough items exist. |
-| `settings.max_stories` | `15` | Max stories the LLM is asked to pick. |
-| `settings.llm_timeout` | `60` | Seconds per Gemini request (per attempt). |
-| `settings.llm_retries` | `1` | Primary retries after trying the backup model. |
-| `settings.llm_backoff` | `2` | Seconds before the primary retry; doubles if more retries are configured. |
-| `settings.llm_final_wait` | `15` | Seconds to wait before the last try of the primary model (shortened if needed to fit the cap). |
-| `settings.llm_step_cap` | `900` | Hard cap on the whole LLM step (both passes and article fetching), in seconds. |
-| `settings.user_agent` | browser UA string | Sent with feed requests; some sites block default Python agents. |
-| `email.subject_prefix` | `AI Daily News Digest` | Digest name used in the masthead and in the fallback subject when no headline is available. |
-| `email.from_name` | `AI News` | Display name on the From line. |
-| `email.to_name` | `Noah Sher` | Display name on the To line. |
-| `feeds[]` | 13 feeds | Each has `name` (shown in the email), `url` and `max_items` (cap per run). Optional: `snippet_chars` (snippet length sent to the LLM, default 300), `strip_publisher: true` (Google News: strip ` - Publisher` from titles and show the publisher as the source), `expand_issue: true` (TLDR: create separate story items from its web page). |
-
-Headers are built with `email.utils.formataddr`, so names containing `&` or non-ASCII characters are encoded correctly.
-
-### News sources
-
-| Source | `max_items` | Notes |
-| --- | --- | --- |
-| TechCrunch AI | 15 | |
-| The Verge AI | 10 | |
-| Ars Technica AI | 10 | |
-| MIT Technology Review AI | 10 | Publishes a few times a week; often 0 items in a given 26h window. |
-| Wired AI | 10 | |
-| The Decoder | 15 | |
-| OpenAI News | 10 | Only has items on days OpenAI posts. |
-| Google DeepMind | 10 | Only has items on days DeepMind posts. |
-| Hugging Face Blog | 10 | |
-| TLDR AI | 5 | Issues are expanded into separate stories with up to 1500 characters each. The five-item cap applies to stories; timestamps come from the issue. Extraction failures log a warning and retain the issue as a fallback. |
-| Google News – AI | 20 | Search: "artificial intelligence" OR "generative AI" OR LLM. Publisher shown as the source. |
-| Google News – Labs | 15 | Search: Anthropic OR "Meta AI" OR xAI OR Mistral. Publisher shown as the source. |
-| Hacker News (100+ points) | 15 | Front-page stories with 100+ points. |
-
-A source with 0 items on a given day is normal (quiet blogs, weekends). A source that **fails** logs `ERROR <name>: failed, skipping`.
-
-### Add or remove a news source
-
-Add an entry under `feeds:` (any RSS or Atom feed works):
-
-```yaml
-  - name: The Register
-    url: https://www.theregister.com/headlines.atom
-    max_items: 10
-```
-
-To remove one, delete its three lines. Feed order selects the representative headline for exact duplicate groups; every original source link and the best snippet per publisher remain available. Test a new feed with a dry run (see [Running locally](#running-locally-optional)); a bad URL shows up as `ERROR <name>: failed, skipping`.
-
-### Change the number of stories or the lookback window
-
-```yaml
-settings:
-  lookback_hours: 48   # e.g. for a less frequent schedule
-  max_stories: 10
-```
-
-### Change the sections
-
-Sections are **not** in `config.yaml`. They're the `SECTIONS` list near the top of `digest.py`:
-
-```python
-SECTIONS = ["Top stories", "AI models & labs", "Industry & funding", "Policy & society", "Research & tools"]
-```
-
-Edit the list. The prompt passes it to the model in order and tells it to omit empty sections. The rule that "Top stories" holds the 3–4 biggest stories is in `PROMPT` just below; update it if you rename or remove that section.
-
-The email subject previews up to three lead headlines in editorial order. It keeps the full lead headline and adds other topics within a 110-character target, ending with “and more” when the edition contains additional stories. The subject is built from the finished digest without another model call.
-
-### Change the digest name, From name or To name
-
-```yaml
-email:
-  subject_prefix: "Morning Tech Brief"
-  from_name: "Tech Brief"
-  to_name: "Noah"
-```
-
-### Switch the LLM model or provider
-
-The script uses the `openai` Python package against any **OpenAI-compatible** chat-completions endpoint, with JSON mode (`response_format={"type": "json_object"}`).
-
-**Models:** the primary model comes from the `LLM_MODEL` env var, falling back to `DEFAULT_LLM_MODEL` in `digest.py` (currently `gemini-3.5-flash`). The lighter fallback model comes from `LLM_LITE_MODEL`, falling back to `DEFAULT_LLM_LITE_MODEL` (currently `gemini-3.5-flash-lite`). `gemini-3.8-flash` was the default until October 2026, but it frequently returned 503/429 or hung, which caused the fallback emails and a cancelled run.
-
-- Locally: add `LLM_MODEL=…` / `LLM_LITE_MODEL=…` to `.env`.
-- On GitHub: the workflow does **not** pass these today, so the defaults are always used. Either change `DEFAULT_LLM_MODEL` in `digest.py`, or add a repository *variable* (Settings → Secrets and variables → Actions → Variables) and pass it in the workflow's `env:` block:
-  ```yaml
-            LLM_MODEL: ${{ vars.LLM_MODEL }}
-  ```
-
-To see which model names your key can use:
-
-```bash
-.venv/bin/python -c "
-import os; from dotenv import load_dotenv; from openai import OpenAI
-load_dotenv()
-c = OpenAI(api_key=os.environ['LLM_API_KEY'], base_url='https://generativelanguage.googleapis.com/v1beta/openai/')
-print('\n'.join(sorted(m.id for m in c.models.list())))
-"
-```
-
-A name in this list isn't a guarantee: `gemini-2.5-flash` is listed but returns 404 for chat. Test a model with a real dry run before switching.
-
-**Provider:** the base URL is a constant in `digest.py`, **not** an env var:
-
-```python
-LLM_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-```
-
-To switch providers (OpenAI, OpenRouter, a local server, …), change `LLM_BASE_URL` and `DEFAULT_LLM_MODEL`, and put that provider's key in the `LLM_API_KEY` secret. The provider must support JSON mode. If you want it configurable without code edits, change the line to `LLM_BASE_URL = os.environ.get("LLM_BASE_URL") or "https://generativelanguage.googleapis.com/v1beta/openai/"` and pass `LLM_BASE_URL` in the workflow.
-
----
-
-### Free Groq backup setup
-
-1. Sign in at [Groq Console](https://console.groq.com/) and stay on the Free plan. Create an API key named **AI Daily News Digest** under [API Keys](https://console.groq.com/keys).
-2. In this GitHub repository, open **Settings > Secrets and variables > Actions > New repository secret**. Save the key as **GROQ_API_KEY**. Never paste it into a prompt, code, or issue.
-3. The default model is **openai/gpt-oss-120b**, served by Groq, not the OpenAI API. Optionally set repository variable **GROQ_MODEL** to another compatible model ID. Gemini remains primary.
-4. The manually triggered **Verify Groq backup** workflow deliberately makes Gemini unavailable locally, calls real Groq for both stages on three clearly fictional source fixtures, and validates a full result. Enable its **send_email** input only when a test email is wanted. An incomplete result sends nothing; SMTP acceptance still does not confirm inbox delivery. The test does not change daily delivery receipts or story history.
-
-Groq uses a separate client, key, and endpoint. Only batching, evidence budgeting, and pacing differ between providers. Paragraph batches keep the full configured source excerpts whenever the request fits. The GPT-OSS vocabulary estimates input size with a framing reserve; each request reserves 2,600 completion tokens, including reasoning. A rolling 65-second window budgets at most 7,500 tokens, leaving headroom below the published 8,000 TPM free limit. Actual response usage replaces the reservation. The budget is shared across selection and rewriting, and a 100,000-token per-run guard limits retries. This is local pacing, not a guarantee against account-wide limits or outages; other apps and manual reruns share the provider's allowance. Oversized source groups are split and, only when necessary, excerpted further.
-
-Gemini and Groq use the same editorial prompt, grounding rules, ID/link validation, coverage checks, and paragraph-length validator. For accessible articles with at least 800 characters, both are instructed to write 4–6 sentences around 90–160 words. Rewrites under 90 words or four sentences are retried instead of silently accepted. Source-poor stories keep the shorter evidence-only policy. Truncated outputs are rejected. Batch-local subjects and TLDRs never replace the edition-wide introduction. No paid-plan enrollment or provider upgrade is performed; keep the account on Free and review [your account limits](https://console.groq.com/settings/limits).
-
-Offline checks: `python -m unittest discover -s tests -v`. Local live verification requires `GROQ_API_KEY` and `LLM_API_KEY` in the environment; `python verify_groq.py` sends no email, while `python verify_groq.py --send-email` explicitly sends one labeled test after both stages pass. No additional SDK is required.
-
-## Email-only delivery
-
-The hosted reader and Safari test have been removed. The digest continues to be generated and sent through the existing GitHub Actions workflow and iCloud SMTP settings; no website, domain, or web deployment is required. Historical implementation prompts and original design images remain in the repository.
-
-The optional [Google Apps Script monitor](monitoring/README.md) is separate from email delivery. Keeping it provides an independent alert when the expected SMTP receipt is missing or GitHub cannot be checked. It requires no web deployment. If you previously added the reader to that project, follow the [live web-hosting removal steps](monitoring/README.md#remove-the-former-reader-and-keep-the-monitor): repository cleanup does not archive live Google deployments or update their files and triggers. Deleting the entire Google project also removes its independent monitoring, but does not stop the daily digest email.
-
-## Making future changes
-
-Follow [CONTRIBUTING.md](CONTRIBUTING.md): use a `codex/` branch and pull request, then merge through `python3 scripts/merge_pr.py NUMBER` only after the current commit passes **Offline regression tests** and includes the latest `main`. The local pre-push hook blocks direct pushes to `main` when installed. Persistent agent instructions enforce this working convention; GitHub Free does not provide server-enforced branch protection for this private repository. No automatic merging or additional credentials are enabled.
-
-## GitHub access and permissions
-
-**Before making this repository public:** read the [public-release audit](docs/publication-audit.md). Delivery-state artifacts are now encrypted, but the [no-email migration and verified legacy cleanup](docs/encrypted-state.md) must complete before publication. Historical author-email/image-sharing decisions still need resolution. The repository remains private.
-
-The [GitHub access audit and manual token checklist](docs/github-access-audit.md) records the live repository settings and their limitations. Actions are restricted to the allowlisted action repositories with full SHA pins required. Checkouts do not persist credentials, and explicit workflow GitHub-token exposure is limited to send-window checking and state restoration. Dependabot alerts and weekly reviewable update PRs help maintain dependencies. The cron-job.org scheduler and Google monitor need separate, one-repository tokens with Actions write and Actions read access respectively; neither token belongs in the repository.
-
-## Secrets
-
-The workflow reads the following repository secrets. The optional Groq key is exposed only during preparation; SMTP credentials are used for sending.
-
-| Secret | What it is | Where it comes from | Example (placeholder) |
-| --- | --- | --- | --- |
-| `DIGEST_STATE_KEY` | Required artifact-encryption key; keep a secure backup | [Setup and migration](docs/encrypted-state.md) | `<generated-fernet-key>` |
-| `GROQ_API_KEY` | Optional independent backup API key | [Groq Console](https://console.groq.com/keys) | `<your-groq-api-key>` |
-| `LLM_API_KEY` | Gemini API key | [Google AI Studio](https://aistudio.google.com/) → Get API key | `<your-gemini-api-key>` |
-| `SMTP_HOST` | iCloud SMTP server | Apple's iCloud Mail settings | `smtp.mail.me.com` |
-| `SMTP_PORT` | SMTP port (STARTTLS) | Apple's iCloud Mail settings. Defaults to 587 if empty. | `587` |
-| `SMTP_USER` | Login for SMTP: your primary iCloud Mail address | Your Apple account | `<you>@icloud.com` |
-| `SMTP_PASSWORD` | An **app-specific password**, not your Apple account password | [account.apple.com](https://account.apple.com) → Sign-In and Security → App-Specific Passwords | `<app-specific-password>` |
-| `EMAIL_TO` | Where the digest is delivered | You choose | `<you>@icloud.com` |
-| `EMAIL_FROM` | The iCloud alias the digest is sent from. If empty or missing, the script sends from `SMTP_USER`. | iCloud Mail → Settings → Accounts → add an alias | `<your-alias>@icloud.com` |
-
-If `EMAIL_FROM` is missing the run still works. If any of the required others is missing the run fails (a `KeyError` in the logs), except `SMTP_PORT`, which falls back to 587. Missing `GROQ_API_KEY` simply disables Groq. A missing or invalid `DIGEST_STATE_KEY` stops restore with a safe configuration error before preparation; configure the key and complete migration instead of resetting state.
-
-**Update a secret:** GitHub repo → **Settings** → **Secrets and variables** → **Actions** → click the secret → **Update secret** → paste the new value → save. The next run uses it; no code change or commit needed.
-
-> GitHub Secrets **can't be viewed after saving**, only replaced. Keep a copy of each value in a password manager.
-
----
-
-## Running locally (optional)
-
-Requires Python 3.13.
-
-```bash
-git clone https://github.com/Nsher02/ai-daily-news-digest.git
-cd ai-daily-news-digest
+```sh
 python3.13 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -v
+node tests/test_google_apps_script.cjs
 ```
 
-Create `.env` in the project root. `digest.py` loads it with `python-dotenv`; real environment variables take precedence.
+Dependencies are downloaded during installation. The regression checks use mocked services and do not send email or consume model quota.
 
-```dotenv
-LLM_API_KEY=<your-gemini-api-key>
-SMTP_HOST=smtp.mail.me.com
-SMTP_PORT=587
-SMTP_USER=<you>@icloud.com
-SMTP_PASSWORD=<app-specific-password>
-EMAIL_TO=<you>@icloud.com
-EMAIL_FROM=<your-alias>@icloud.com
-# optional:
-# LLM_MODEL=gemini-3.5-flash
-# LLM_LITE_MODEL=gemini-3.5-flash-lite
-```
-
-**Dry run** (fetches and summarizes for real, but saves `digest.html` and prints the plain-text version instead of emailing):
-
-```bash
-.venv/bin/python digest.py --dry-run
-open digest.html
-```
-
-**Real send:**
-
-```bash
-.venv/bin/python digest.py
-```
-
-> **Never commit `.env`.** It's in `.gitignore`; keep it that way. Check `git status` before every commit.
-
-Logs go to stderr as `LEVEL message`. The `openai` package logs one `INFO HTTP Request: POST …` line per call; it shows the URL and status, never the key.
-
----
-
-## Maintenance and troubleshooting
-
-### A red Actions run
-
-Open **Actions** → the failed run → the **digest** job → expand **Build and send digest** (or **Install dependencies** if it failed earlier). Errors are lines starting with `ERROR`, or a Python traceback at the end. The workflow also emails you "AI Daily News Digest failed – check GitHub Actions" when any step fails.
-
-| Symptom in the log | Likely cause | Fix |
-| --- | --- | --- |
-| `KeyError: 'SMTP_USER'` (or another name) | A secret is missing or misnamed. Names are case-sensitive and must match the table above exactly. | Add or rename the secret. |
-| `sending email failed: (535, …)` or another auth error | App-specific password revoked or wrong; `SMTP_USER` wrong. | Generate a new app-specific password and update `SMTP_PASSWORD`. |
-| `sending email failed` mentioning the sender address | `EMAIL_FROM` isn't an active alias on the `SMTP_USER` account. | Fix the alias, or delete the `EMAIL_FROM` secret to send from `SMTP_USER`. |
-| `LLM pass N attempt N (…) failed …: HTTP 503` or `HTTP 429` | Gemini overloaded or rate-limited. A later attempt usually succeeds. If all fail, the email goes out as raw headlines and the run stays **green**. | Usually transient. If it happens daily, check your quota in AI Studio or switch `DEFAULT_LLM_MODEL`. |
-| `LLM pass N attempt N (…) failed …: APITimeoutError` | A request hung past the 60s timeout. | Transient; the chain moves on. |
-| `LLM pass N attempt N (…) failed …: HTTP 400`/`401`/`403`/`404` | Bad or revoked `LLM_API_KEY`, or the model name no longer exists. | Rotate the key, or update `DEFAULT_LLM_MODEL` / `DEFAULT_LLM_LITE_MODEL`. |
-| `LLM summary failed … LLM stage deadline reached` | Every attempt hung; the watchdog stopped the step and sent raw headlines. | Transient Gemini outage; no action unless it repeats. |
-| `429 … Generate content requests per day limit exceeded` | The free tier's 20 requests/day for that model is used up (usually from many manual test runs). The chain skips straight to Flash-Lite. | Wait for the daily reset; avoid many test runs in one day. |
-| `paragraph summaries failed, using short summaries` | Pass 2 failed on every attempt. The email still has the pass-1 short summaries. | Transient; no action unless it repeats. |
-| `article fetch failed for <url>` / `could not resolve Google News link` | A paywall, block or timeout on one article. That story gets a shorter snippet-based summary. | None; normal for a few stories a day. |
-| `Skipping: today's digest was already sent by run …` | Normal for the later morning firings after the first one sent. | None. |
-| `Skipping: … outside the 07:45-10:00 Chicago send window` | Normal for the firings that land before 7:45 AM (and after 10:00 AM). | None. |
-| `ERROR <feed>: failed, skipping (…)` | One feed is down, moved, or blocking the request. The run continues and stays green. | If it repeats for days, fix or remove the URL in `config.yaml`. |
-| `Error: The operation was canceled` after 20 minutes | Hit `timeout-minutes: 20`. Shouldn't happen, since the LLM step is capped at 10 minutes. | Rerun, and check which step was slow. |
-
-### Changing your Apple account password
-
-Changing your Apple account password **revokes all app-specific passwords**. The next run will fail at login. Generate a new app-specific password at account.apple.com → Sign-In and Security → App-Specific Passwords, then update the `SMTP_PASSWORD` secret (and your local `.env`).
-
-### Rotating the Gemini key
-
-1. In Google AI Studio, create a new API key.
-2. Update the `LLM_API_KEY` secret on GitHub (and in `.env`).
-3. Trigger a manual run and confirm the email has AI summaries, not the raw-headlines fallback.
-4. Delete the old key in AI Studio.
-
-### The iCloud alias (`EMAIL_FROM`)
-
-- The script **logs in** as `SMTP_USER` but puts `EMAIL_FROM` on the From line. iCloud only accepts From addresses that belong to the logged-in account, so the alias must exist and be enabled on that same account.
-- The **display name** ("AI News") comes from `email.from_name` in `config.yaml`, not from the alias's own name setting in iCloud.
-- iCloud Mail's own "send from" default (in iCloud Mail settings) only affects mail you write in the Mail apps. The script sets the From header explicitly, so it doesn't depend on that setting.
-- To stop using the alias, delete the `EMAIL_FROM` secret (or leave it empty); the script falls back to `SMTP_USER`.
-
-### If the repo is ever made public
-
-The repo is currently private. In a **public** repository, GitHub automatically disables scheduled workflows after **60 days with no repository activity**. If that happens, re-enable the workflow from the Actions tab or push any commit. Also review what's committed (`prompts/`, `digest.html`) before making it public.
-
-### Cost
-
-- **Gemini:** 2 requests per day on a normal run (pass 1 + pass 2; at most 11 on a very bad day). The free tier allows **20 requests per day per model**, so a manual test run or two is fine, but many test runs in one day will hit `429 … PerDay` and fall back to Flash-Lite until the quota resets. Free-tier limits and model availability change over time; check AI Studio if you start seeing 429s.
-- **GitHub Actions:** a normal run takes a minute or two, and the skipped GitHub cron firings each take a few seconds. cron-job.org is free. A run where Gemini is down can take about 12 minutes because of the 10-minute LLM cap. Public repos get free minutes on standard runners; private repos draw from the account's monthly included minutes (2,000 on the Free plan), so a daily run uses only a small fraction.
-- **iCloud Mail:** included with your Apple account.
-
-
-## Offline regression checks
-
-The **Automated tests** workflow runs on every push and pull request, and can also be started from **Actions > Automated tests > Run workflow**. It runs the Python regression suite, seven mocked Google monitor scenarios, and monitor syntax/manifest checks. View the green check or failure details in the commit, pull request, or Actions tab. It uses no email or AI secrets and does not run the digest delivery workflow. Dependency installation needs network access; the tests use mocked services. Test runs have their own concurrency group, so they cannot cancel daily delivery. See [the workflow](.github/workflows/tests.yml) and [implementation prompt](prompts/prompt_29_automatic_testing.md).
-
-Run `.venv/bin/python -m unittest discover -s tests -v`. Tests cover delivery outcomes, the send window (CST, CDT, DST switch days, receipts, early manual runs, external trigger vs GitHub cron, manual always sends), duplicate evidence preservation, TLDR parsing and fallback, editorial validation, and short-selection retry behavior. SMTP and Gemini are mocked; tests do not send email or consume API quota. The TLDR parser was also checked against the public October 30, 2026 issue.
-
-Implementation prompts are in `prompts/prompt_12_track_email_delivery.md` through `prompts/prompt_15_validate_editorial_output.md`, executed sequentially with checks after each stage.
-
-
-## Run summaries and offline replay
-
-Each executed digest writes a GitHub Actions step summary with successful/configured feeds, grouped candidates, selected stories, retrieved articles, LLM attempts, summary quality (`full`, `partial_pass_2`, `pass_1`, `raw_headlines`, or `none`), deadline status, and send outcome. A feed returning zero recent items still counts as a successful fetch. Attempt counts are saved before each model call, so a killed worker's in-flight attempt is included. Article counts include completed fetch results even if another worker hangs. Skipped backup runs report the existing receipt. A runner killed outside the supervised LLM stage may prevent the final summary from being written.
-
-To save a snapshot during a live dry run (fetches feeds and calls Gemini, but does not send email):
+To render the supplied synthetic fixture without loading credentials, fetching feeds, or calling a model:
 
 ```sh
-.venv/bin/python digest.py --dry-run --save-replay /private/tmp/digest-replay.json --output /private/tmp/digest-preview.html
+.venv/bin/python digest.py --replay tests/fixtures/replay.json \
+  --output /private/tmp/digest-preview.html
 ```
 
-To reparse successful saved model replies and render fully offline:
+`--dry-run` avoids sending email but still fetches real feeds and calls AI providers. Plain `python digest.py`, `--send-prepared`, and manual delivery dispatches can send real email. Use them only with explicit authorization. The optional Groq verification scripts also make real API calls; they are not part of offline regression testing.
 
-```sh
-.venv/bin/python digest.py --replay /private/tmp/digest-replay.json --output /private/tmp/digest-replayed.html
-```
+## Project layout
 
-Replay returns before loading `.env`, fetching feeds, constructing the API client, or sending email. It never writes a sent receipt. It preserves the original digest date. Raw-headline snapshots render without model replies. If parser changes reorder or remove selected stories, replay rejects saved pass-2 numbering rather than attaching a summary to the wrong story.
+| Path | Responsibility |
+| --- | --- |
+| `digest.py` | Feed collection, grouping, evidence retrieval, provider fallback, validation, rendering, and delivery. |
+| `config.yaml` | Feeds, evidence/history limits, retry budgets, and email display settings. |
+| `send_window.py` | Chicago-time window checks, SMTP receipts, and monitoring helpers. |
+| `restore_state.py` | Trusted artifact selection and authenticated state restoration. |
+| `state_crypto.py`, `state_maintenance.py` | State encryption and controlled legacy-artifact maintenance. |
+| `.github/workflows/` | Daily delivery, offline CI, and manually invoked verification/maintenance. |
+| `monitoring/` | Independent Google Apps Script monitor and setup instructions. |
+| `tests/` | Regression tests, mocked monitor checks, and synthetic replay fixtures. |
+| `scripts/`, `.githooks/` | Exact-commit merge checks and local direct-push protection. |
+| `prompts/` | Preserved implementation prompts; not loaded by the runtime. |
+| `design/` | Preserved email design references. |
+| `docs/` | Encryption, access, and historical audit documentation. |
 
-Snapshots contain source text, article excerpts, selected stories and successful model replies; they explicitly omit credentials and environment variables. Save personal snapshots outside the repository. For an immediate synthetic offline example, use `tests/fixtures/replay.json` as the replay input. These snapshots support parser/rendering development; they do not measure how a live model responds to edited prompts.
-
-Prompts 16–18 implement grounding, subprocess deadlines, and summaries/replay sequentially. Regression tests include malformed JSON, partial rewrites, article failures, deadline exhaustion, real sleeping subprocess termination, saved checkpoints, replay isolation, and delivery outcomes. No additional runtime dependencies were introduced.
-
-
-## State and recovery verification
-
-The workflow uses the existing read-only Actions permission to restore state and the artifact action to publish pre-send and final state. Archives contain only authenticated ciphertext; sender/recipient addresses and prepared bodies are inside the encrypted envelope. No SMTP passwords or API keys are stored in that envelope. `.digest-state/` and encrypted staging are ignored by Git. Restore verifies the producing workflow/event/repository/branch and authenticates all expected state members before writing them. Missing keys, corruption, and unmigrated plaintext stop recovery rather than silently resetting it.
-
-For an ambiguous delivery, inspect the workflow logs, the latest encrypted artifact after authorized local decryption, and the receiving mailbox before taking recovery action. A confirmed accepted record should remain `smtp_accepted`. Only mark an edition safely retryable after confirming it was not accepted. Reusing an accepted record can repair history and produce a receipt without resending. A corrupted prepared record blocks automatic sending and requires review. Never edit state to force a resend without checking the prior outcome.
-
-The regression suite includes mocked preparation, artifact restoration, SMTP acceptance, explicit rejection, connection loss during submission, restart without feed/AI calls, original source evidence matching, partial-subject fallbacks, and monitor in-flight status. Run `.venv/bin/python -m unittest discover -s tests -v`. Live SMTP, model availability and inbox delivery require separate verification. The standalone Google monitor has separate installation and maintenance steps in [monitoring/README.md](monitoring/README.md); the degraded-quality monitoring helper remains inactive.
-
-### Full-size Groq verification
-
-**Actions > Verify full Groq summaries > Run workflow** verifies 15 preselected fictional stories against real Groq and checks complete numbered coverage and paragraph lengths. It makes no email calls and has no SMTP secrets. Its one-day artifact contains a rendered preview and word-count statistics. Local equivalent: `python verify_groq_batches.py` with `GROQ_API_KEY` configured. This complements the existing three-story end-to-end failover test; synthetic verification does not prove live article availability or factual accuracy on every edition.
-
-The delivery-state encryption key is an additional required repository secret, **DIGEST_STATE_KEY**. Back it up securely and follow [the key, migration and cleanup guide](docs/encrypted-state.md); no new account, domain, paid service or email provider is needed.
+There is no hosted reader or RSS output service in the current project. Email remains the delivery channel. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the change-and-review process.
