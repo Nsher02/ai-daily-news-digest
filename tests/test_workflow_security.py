@@ -26,18 +26,24 @@ class WorkflowSecurityTests(unittest.TestCase):
                     if not action:
                         continue
                     with self.subTest(workflow=filename, action=action):
-                        self.assertRegex(action, r'^[\w.-]+/[\w.-]+@[a-f0-9]{40}$')
+                        self.assertRegex(action, r'^[\w.-]+/[\w.-]+(?:/[\w.-]+)*@[a-f0-9]{40}$')
                         self.assertTrue(any(fnmatch.fnmatchcase(action, p) for p in policy['patterns_allowed']))
                         if action.startswith('actions/checkout@'):
                             self.assertEqual(step.get('with', {}).get('persist-credentials'), 'false')
 
-    def test_workflow_tokens_never_gain_write_permissions(self):
+    def test_workflow_tokens_only_allow_codeql_to_publish_security_results(self):
         for filename, workflow in workflows().items():
             for scope in [workflow, *workflow['jobs'].values()]:
                 with self.subTest(workflow=filename):
                     permissions = scope.get('permissions', {})
                     self.assertIsInstance(permissions, dict)
-                    self.assertTrue(all(p in ('read', 'none') for p in permissions.values()))
+                    for permission, level in permissions.items():
+                        if level == 'write':
+                            self.assertEqual(filename, 'codeql.yml')
+                            self.assertIs(scope, workflow['jobs']['analyze'])
+                            self.assertEqual(permission, 'security-events')
+                        else:
+                            self.assertIn(level, ('read', 'none'))
             self.assertIn('permissions', workflow)
             self.assertNotIn('pull_request_target', workflow.get('on', {}))
 
@@ -88,7 +94,7 @@ class WorkflowSecurityTests(unittest.TestCase):
             if not {'push', 'pull_request'}.intersection(workflow.get('on', {})):
                 continue
             with self.subTest(workflow=filename):
-                self.assertNotRegex(json.dumps(workflow), r'secrets\s*\.')
+                self.assertNotRegex(json.dumps(workflow), r'\$\{\{\s*secrets\s*[.\[]')
 
 
 if __name__ == '__main__':

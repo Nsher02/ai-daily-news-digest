@@ -37,7 +37,7 @@ If no custom hooks would be displaced, install the local direct-push safeguard:
 git config --local core.hooksPath .githooks
 ```
 
-The hook blocks direct pushes, force pushes, and deletions targeting `main`. It is a checkout-local safeguard, not a replacement for GitHub branch protection; it must be installed in each new clone.
+The pre-push hook blocks direct pushes, force pushes, and deletions targeting `main`. The pre-commit hook checks staged additions with the checksum-pinned Gitleaks CLI; it downloads the official binary when invoked and blocks commits if the scan cannot complete. It is a checkout-local safeguard, not a replacement for GitHub branch protection; it must be installed in each new clone.
 
 ## Make and validate a change
 
@@ -63,6 +63,7 @@ The hook blocks direct pushes, force pushes, and deletions targeting `main`. It 
    Installation needs network access; these tests use mocked services. Documentation-only edits need content/link review and whitespace checks, with the required hosted regression job still passing before merge. A replay of `tests/fixtures/replay.json` is safe for offline rendering. A dry run or Groq verification uses live services even if it sends no email.
 4. Commit with a concise, specific message, push the branch, and open a PR. Use the [PR template](.github/pull_request_template.md) to explain the problem, resulting behavior, validation, and any relevant limits.
 5. Wait for **Automated tests / Offline regression tests** on the current PR commit. A previous commit's green result, a push-only run, or a skipped job is insufficient for the merge helper.
+   CodeQL and Gitleaks must also pass. CodeQL publishes results to the Security tab; Gitleaks deliberately suppresses raw findings to avoid leaking secrets in logs. For a Gitleaks failure, reproduce locally with the pinned CLI and review redacted output privately; never post raw findings in a public issue.
 6. If `main` changes, update the PR branch with a merge, resolve conflicts, push, and wait for the new PR checks:
 
    ```sh
@@ -95,7 +96,7 @@ Delete the feature branch when it is no longer needed. A merge can trigger offli
 
 ## Repository protections and private data
 
-The public repository's `main` protection requires a PR, passing **Offline regression tests** from GitHub Actions, an up-to-date branch, and resolved review conversations. It applies to administrators, blocks force pushes and deletions, and does not require another person's approval for the owner's PRs. Keep those protections enabled.
+The public repository's `main` protection requires a PR, passing **Offline regression tests**, **Gitleaks**, and both **CodeQL** language jobs from GitHub Actions, an up-to-date branch, and resolved review conversations. It applies to administrators, blocks force pushes and deletions, and does not require another person's approval for the owner's PRs. Keep those protections enabled.
 
 Workflow defaults are read-only, permitted actions are SHA-pinned, and checkouts discard persisted credentials. Outside contributors' workflows require approval. Push/PR regression tests receive no AI or SMTP secrets. Secret scanning and push protection help catch supported credential patterns, but do not replace review.
 

@@ -5,6 +5,8 @@
     "actions/checkout@*",
     "actions/setup-python@*",
     "actions/setup-node@*",
-    "actions/upload-artifact@*"
+    "actions/upload-artifact@*",
+    "github/codeql-action/init@*",
+    "github/codeql-action/analyze@*"
   ]
 }
