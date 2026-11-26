@@ -66,13 +66,24 @@ Before SMTP submission, the workflow reserves the prepared edition and uploads e
 - **Credentials:** API keys, SMTP credentials, recipient/sender addresses, and `DIGEST_STATE_KEY` belong in Actions secrets or a private local `.env`, never in tracked files, PRs, screenshots, or logs.
 - **Encrypted artifacts:** `state_crypto.py` uses authenticated Fernet encryption. Uploaded delivery-state archives contain only `state.enc`; recovery checks repository, branch, purpose, producing workflow/event, and the permitted file inventory before restoring anything.
 - **Retention:** delivery-state artifacts expire after seven days. Keep the encryption key backed up in a password manager; losing it prevents recovery of those artifacts. See [`docs/encrypted-state.md`](docs/encrypted-state.md).
-- **Workflow access:** actions use full commit pins, checkout credentials are not persisted, and workflow tokens have explicit read permissions. Push/PR regression tests receive no AI or SMTP secrets.
+- **Workflow access:** actions use full commit pins, checkout credentials are not persisted, and workflow defaults are read-only. The CodeQL analysis job has a scoped security-results publishing permission. Push/PR regression tests receive no AI or SMTP secrets.
 - **Repository protections:** `main` requires PRs, current **Offline regression tests**, an up-to-date branch, and resolved review conversations. The rule applies to administrators; force pushes and branch deletion are blocked.
 - **Public contributions:** outside contributors' workflows require approval. Secret scanning, push protection, Dependabot alerts/security updates, and private vulnerability reporting are enabled in repository settings. These settings are configured separately from the source code.
 
 A public repository exposes tracked files, commit metadata, PRs, and Actions logs. Encryption protects the saved artifact payloads; it does not make the entire repository private or eliminate supply-chain risk. Review workflow and dependency changes before merging, even when tests pass. Do not include private information in a public issue; use the repository's private vulnerability-reporting option for security reports.
 
 Historical audit documents under [`docs/`](docs/) record earlier snapshots and may describe settings that have since changed. They are not a guarantee that every future change is safe.
+
+## Automated security scans
+
+Two additional checks run independently of delivery and receive no SMTP, model, or artifact-encryption secrets:
+
+- **CodeQL** analyzes Python and JavaScript/TypeScript on PRs, pushes to `main`, and a weekly schedule. It uses GitHub's free public-repository code scanning on standard hosted runners. Only its analysis job has `security-events: write`, to publish results to the Security tab; it cannot write repository contents.
+- **Gitleaks** scans fetched Git history on pushes, PRs, and weekly. It uses the free standalone CLI, with a fixed version and reviewed archive checksums, rather than a licensed third-party action. Its wrapper suppresses raw scanner output, fully redacts findings, and fails closed if installation or scanning cannot finish. It does not upload finding artifacts.
+
+Both scanners are required alongside offline regression tests before merging to `main`. Scanning can miss vulnerabilities or flag harmless examples; investigate failures rather than bypassing them. Do not add broad exclusions for prompts or tests.
+
+For a local history scan, run `python3 scripts/scan_secrets.py`. The command downloads and verifies the official pinned Gitleaks binary, then scans without sending code to a scanning service. With `core.hooksPath=.githooks` installed, the pre-commit hook also checks staged additions. Supported local platforms are macOS and Linux on x64/ARM64. Scanners never detect or remove a publicly visible commit-author email; use a GitHub noreply identity for future commits.
 
 ## Configure your own installation
 
