@@ -203,6 +203,50 @@ def news(title, url, source='Publisher', summary=''):
     return dict(title=title, link=url, source=source, summary=summary, snippet_chars=300, image='')
 
 
+class GoogleNewsURLTests(unittest.TestCase):
+    def test_matches_parsed_google_news_host_with_case_and_ports(self):
+        for url in [
+            'https://news.google.com/rss/articles/story',
+            'http://news.google.com/articles/story',
+            'https://NEWS.GOOGLE.COM/rss/articles/story',
+            'https://news.google.com:443/rss/articles/story',
+        ]:
+            with self.subTest(url=url):
+                self.assertTrue(digest.is_google_news(url))
+
+    def test_rejects_lookalikes_and_domain_text_outside_the_hostname(self):
+        for url in [
+            'https://evilnews.google.com/articles/story',
+            'https://news.google.com.example.test/articles/story',
+            'https://sub.news.google.com/articles/story',
+            'https://news.google.com@example.test/articles/story',
+            'https://example.test/news.google.com',
+            'https://example.test/?next=https://news.google.com',
+            'https://example.test/#news.google.com',
+            '',
+            '/news.google.com/articles/story',
+            'https://[invalid',
+        ]:
+            with self.subTest(url=url):
+                self.assertFalse(digest.is_google_news(url))
+
+    def test_enrichment_resolves_only_the_actual_google_news_host(self):
+        lookalike = 'https://evilnews.google.com/articles/story'
+        google = 'https://NEWS.GOOGLE.COM:443/rss/articles/story'
+        publisher = 'https://publisher.test/story'
+        for original, expected, decoded in [(lookalike, lookalike, False), (google, publisher, True)]:
+            with self.subTest(url=original):
+                item = news('Story', original)
+                story = {'ids': [0], 'links': [{'source': 'Publisher', 'url': original}]}
+                with patch.object(digest, 'decode_google_news', return_value=publisher) as resolve, \
+                        patch.object(digest, 'fetch_article', return_value=('Public article evidence', '')) as fetch:
+                    enriched = digest.enrich_story(story, [item], {'article_timeout': 10})
+                self.assertEqual(resolve.call_count, int(decoded))
+                fetch.assert_called_once_with(expected, {'article_timeout': 10}, None)
+                self.assertEqual(enriched['url'], expected)
+                self.assertEqual(enriched['article']['url'], expected)
+
+
 class DuplicateTests(unittest.TestCase):
     def test_transitive_groups_preserve_evidence(self):
         items = [news('First', 'https://a.test/a', 'A'), news('Other', 'https://b.test/b', 'B'), news('First', 'https://b.test/b', 'B')]

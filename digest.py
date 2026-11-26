@@ -860,7 +860,11 @@ def image_ok(url, settings, deadline=None):
 
 
 def is_google_news(url):
-    return urlsplit(url).netloc.endswith("news.google.com")
+    """Only the parsed Google News hostname should use its redirect resolver."""
+    try:
+        return urlsplit(url).hostname == "news.google.com"
+    except ValueError:
+        return False
 
 
 def is_tldr_issue(url):
